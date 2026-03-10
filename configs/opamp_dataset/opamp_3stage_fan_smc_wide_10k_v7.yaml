@@ -1,0 +1,151 @@
+# Op-Amp 3-Stage Fan SMC Dataset Configuration — WIDE RANGES, 10k samples, DC+AC, v7
+#
+# Usage:
+#   python scripts/generate_dataset.py \
+#     --config configs/opamp_dataset/opamp_3stage_fan_smc_wide_10k_v7.yaml \
+#     --output-dir datasets/opamp_3stage_fan_smc_v7_10k
+
+dataset:
+  name: opamp_3stage_fan_smc
+  template: netlists/opamp_3stage_fan_smc_template.sp
+  ac_template: netlists/opamp_3stage_fan_smc_ac_template.sp
+  description: Three-stage Fan SMC op-amp — wide ranges, 10k samples, DC+AC, filtered
+
+graph_encoding:
+  normalize_props: true
+
+# Device-to-group mapping for group-based normalization
+device_to_group:
+  # PMOS bias mirrors (M0-M7)
+  M0: BIASCM_P
+  M1: BIASCM_P
+  M2: BIASCM_P
+  M3: BIASCM_P
+  M4: BIASCM_P
+  M5: BIASCM_P
+  M6: BIASCM_P
+  M7: BIASCM_P
+  # Stage 1: PMOS diff pair (M8-M9)
+  M8: GM1
+  M9: GM1
+  # Stage 2: PMOS common-source (M10)
+  M10: GM2
+  # Stage 3: PMOS output (M11)
+  M11: GMF2
+  # NMOS bias/cascode (M12-M20)
+  M12: BIASCM_N
+  M13: BIASCM_N
+  M14: BIASCM_N
+  M15: BIASCM_N
+  M16: BIASCM_N
+  M17: BIASCM_N
+  M18: BIASCM_N
+  M19: BIASCM_N
+  M20: BIASCM_N
+  # Stage 2 NMOS load (M21-M22)
+  M21: LOAD2
+  M22: LOAD2
+  # Stage 3: NMOS output (M23)
+  M23: GM3
+
+# Devices to exclude from current targets (voltage sources used for biasing)
+excluded_current_devices:
+  - vcm_ref
+  - lbreak
+  - vac_inj
+
+# Pre-batching configuration
+pre_batching:
+  enabled: true
+  batch_size: 1024
+  num_batching_variants: 10
+  seed: 42
+
+  # Split ratios
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88
+
+# Sampling configuration
+sampling:
+  method: lhs
+  total_samples: 10000
+  max_attempts_multiplier: 20.0   # raised — multiple filters now reject ~50% of SPICE runs
+  n_workers: 20
+  save_interval: 1000
+
+  filter:
+    enabled: true
+    rail_margin: 0.1
+    # Only exclude nodes that are truly physically at a rail:
+    # gnda = analog ground (always 0V)
+    # dm_2, net063 = diff pair drains (NMOS load pulls to GND ~83%)
+    # net31 = diff pair source (near VDD ~73%)
+    # net54, net56 = cascode intermediate nodes (near GND ~84%)
+    exclude_nodes:
+      - gnda
+      - dm_2
+      - net063
+      - net31
+      - net54
+      - net56
+    saturation_only: false
+
+    # Drop samples where an entire bias mirror chain collapsed.
+    # Distribution has a clear valley at 7 before jumping 5x at 8
+    # (8 = BIASCM_P size, 9 = BIASCM_N size).
+    max_cutoff_devices: 7
+
+    # Drop samples where AC simulation failed to extract gain/phase.
+    # 20.8% of v6 samples had no valid AC result — these circuits have
+    # no loop gain and are useless as opamp training data.
+    require_ac_convergence: true
+
+    # Drop circuits with effectively zero gain-bandwidth (< 1kHz).
+    # AC technically "converged" but UGBW ≈ 0 means the circuit isn't
+    # amplifying at all. 1kHz is a very loose lower bound.
+    min_ugbw_hz: 1000
+
+  constraints: []
+
+parameters:
+  # === MOSFET WIDTHS (log-scale, per finger) ===
+  W_BIASCM_P: { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_BIASCM_N: { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GM1:      { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GM2:      { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GM3:      { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GMF2:     { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_LOAD2:    { min: 0.42e-6, max: 50.0e-6, scale: log }
+
+  # === MOSFET LENGTHS (log-scale) ===
+  L_BIASCM_P: { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_BIASCM_N: { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GM1:      { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GM2:      { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GM3:      { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GMF2:     { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_LOAD2:    { min: 0.15e-6, max: 20.0e-6, scale: log }
+
+  # === MOSFET MULTIPLIERS (log-scale, integer) ===
+  M_BIASCM_P: { min: 1, max: 100, scale: log, type: int }
+  M_BIASCM_N: { min: 1, max: 100, scale: log, type: int }
+  M_GM1:      { min: 1, max: 100, scale: log, type: int }
+  M_GM2:      { min: 1, max: 100, scale: log, type: int }
+  M_GM3:      { min: 1, max: 100, scale: log, type: int }
+  M_GMF2:     { min: 1, max: 100, scale: log, type: int }
+  M_LOAD2:    { min: 1, max: 100, scale: log, type: int }
+
+  # === BIAS CURRENT & COMPENSATION ===
+  I_BIAS: { min: 0.5e-6, max: 100.0e-6, scale: log }
+  C_COMP: { min: 0.5e-12, max: 30.0e-12, scale: log }
+
+  # === OPERATING POINT ===
+  VCM:   { min: 0.7, max: 0.9, scale: linear }
+  VDIFF: { min: -0.05, max: 0.05, scale: linear }
+
+  # === FIXED PARAMETERS ===
+  VDD:  { value: 1.8 }
+  R_IN: { value: 50000 }
+  R_F:  { value: 50000 }

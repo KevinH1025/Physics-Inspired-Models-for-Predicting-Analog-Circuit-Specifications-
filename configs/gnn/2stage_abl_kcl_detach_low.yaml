@@ -1,0 +1,99 @@
+# Ablation: KCL detach backbone + lower weight (0.5)
+
+data:
+  path: datasets/opamp_2stage_5k_ss_v3
+  prebatched: true
+  max_preload_variants: 10
+  preload_to_gpu: true
+
+model:
+  type: deepgen
+  hidden_dim: 128
+  num_layers: 15
+  dropout: 0.0
+  genconv_num_layers: 2
+  norm_type: layer
+  skip_connection: true
+  gradient_checkpointing: true
+
+  virtual_node:
+    enabled: true
+    learn_temperature: false
+    attention_pooling: true
+
+  jk:
+    mode: cat
+    attention: true
+    learn_temperature: false
+
+  heads:
+    voltage:
+      num_layers: 1
+      hidden_dim: 128
+      dropout: 0.0
+    current:
+      enabled: true
+      num_layers: 2
+      hidden_dim: 128
+      dropout: 0.0
+    ss:
+      enabled: false
+    ac:
+      enabled: false
+    current_gnn:
+      enabled: false
+
+loss:
+  type: mse
+  huber_delta: 1.0
+  current_weight: 1.0
+  current_warmup_epochs: 0
+
+  kcl_weight: 0.5
+  kcl_mode: logsumexp
+  kcl_detach_backbone: true
+
+  stage2_weight: 1.0
+  stage2_nodes: [vout, vout_stage1, vg2, vc]
+
+  current_constraints:
+    weight: 0.0
+
+  gm_physics_loss:
+    weight: 0.0
+
+  triode_physics_loss:
+    weight: 0.0
+
+  ss_loss:
+    weight: 0.0
+  ac_loss:
+    weight: 0.0
+
+optimizer:
+  lr: 0.001
+  weight_decay: 0.0
+
+scheduler:
+  type: plateau
+  warmup_epochs: 10
+  patience: 45
+  factor: 0.5
+  min_lr: 1.0e-6
+
+training:
+  epochs: 1500
+  batch_size: 128
+  gradient_clip: 1.0
+  val_freq: 1
+  early_stopping_patience: 100
+  seed: 88
+
+normalization:
+  target_type: zscore
+  vdd: 1.8
+
+output:
+  save_best: true
+  save_final: false
+  log_interval: 10

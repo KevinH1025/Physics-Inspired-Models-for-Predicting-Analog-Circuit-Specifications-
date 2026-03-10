@@ -1,0 +1,109 @@
+# Op-Amp 2-Stage Dataset Configuration (V4 - group-based parameters)
+# Enforces matched sizing for diff pair and current mirrors,
+# with physically meaningful L ranges per device function.
+#
+# Group-based parameters:
+#   DIFF   (M1, M2) — differential pair, must be matched
+#   MIRROR (M3, M4) — PMOS active load, must be matched
+#   BIAS L shared (M5, M7, M8) — NMOS current mirror, same L for matching
+#   M6 individual — second-stage PMOS gain device
+#
+# Usage:
+#   python scripts/generate_dataset.py \
+#     --config configs/opamp_dataset/opamp_dataset_v4_grouped.yaml \
+#     --output-dir datasets/opamp_2stage_grouped_v1
+
+dataset:
+  name: opamp_2stage_v4_grouped
+  template: netlists/opamp_2stage_template.sp
+  ac_template: netlists/opamp_2stage_ac_template.sp
+  description: Two-stage op-amp with matched pairs and function-based L ranges
+
+graph_encoding:
+  normalize_props: true
+
+# Device-to-group mapping for group-based normalization
+# Maps device IDs (without X prefix) to group parameter names
+# Normalization lookup: tries W_{device_id} first, falls back to W_{group}
+device_to_group:
+  # Differential pair (matched)
+  M1: DIFF
+  M2: DIFF
+  # PMOS active load mirror (matched)
+  M3: MIRROR
+  M4: MIRROR
+  # NMOS bias mirror (share L_BIAS, individual W)
+  M5: BIAS
+  M7: BIAS
+  M8: BIAS
+
+# Devices to exclude from current targets
+excluded_current_devices:
+  - vcm_ref
+
+# Pre-batching configuration
+pre_batching:
+  enabled: true
+  batch_size: 1024
+  num_batching_variants: 10
+  seed: 42
+
+  # Split ratios
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88
+
+# Sampling configuration
+sampling:
+  method: lhs
+  total_samples: 5000
+  max_attempts_multiplier: 10.0
+  n_workers: 20
+  save_interval: 1000
+
+  filter:
+    enabled: false
+    rail_margin: 0.0
+    exclude_nodes:
+      - tail
+      - nbias
+    saturation_only: false
+
+parameters:
+  # === MATCHED PAIR WIDTHS (log-scale) ===
+  # NOTE: SKY130 model bins cap at wmax=100µm per finger. Use M for wider effective widths.
+  W_DIFF:   { min: 1.0e-6, max: 50.0e-6, scale: log }    # M1, M2 diff pair
+  W_MIRROR: { min: 1.0e-6, max: 50.0e-6, scale: log }    # M3, M4 PMOS load
+
+  # === INDIVIDUAL WIDTHS (log-scale) ===
+  W_M5: { min: 1.0e-6, max: 50.0e-6, scale: log }        # Tail current source
+  W_M6: { min: 5.0e-6, max: 50.0e-6, scale: log }        # Stage 2 PMOS gain
+  W_M7: { min: 5.0e-6, max: 50.0e-6, scale: log }        # Stage 2 NMOS load
+  W_M8: { min: 1.0e-6, max: 50.0e-6, scale: log }        # Bias reference
+
+  # === MATCHED PAIR LENGTHS (log-scale) ===
+  # Signal path: short L for high gm and bandwidth
+  L_DIFF: { min: 0.15e-6, max: 0.5e-6, scale: log }      # M1, M2 diff pair
+  # Mirror/load: long L for matching and high Rout
+  L_MIRROR: { min: 0.5e-6, max: 2.0e-6, scale: log }     # M3, M4 PMOS load
+
+  # === SHARED LENGTHS (log-scale) ===
+  # NMOS bias mirror: long L for accurate current mirroring
+  L_BIAS: { min: 0.5e-6, max: 2.0e-6, scale: log }       # M5, M7, M8 (must match for mirror)
+  # Stage 2 signal path: short L for high gm
+  L_M6: { min: 0.15e-6, max: 0.5e-6, scale: log }        # Stage 2 PMOS gain
+
+  # === BIAS & SIGNAL ===
+  VCM:   { min: 0.7, max: 1.1, scale: linear }
+  VDIFF: { min: -0.05, max: 0.05, scale: linear }
+  I_REF: { min: 5.0e-6, max: 50.0e-6, scale: log }
+
+  # === PASSIVE COMPONENTS (log-scale) ===
+  C_C:  { min: 0.5e-12, max: 5.0e-12, scale: log }
+  R_Z:  { min: 100, max: 10000, scale: log }
+  R_IN: { min: 10000, max: 100000, scale: log }
+  R_F:  { min: 10000, max: 100000, scale: log }
+
+  # === FIXED PARAMETERS ===
+  VDD: { value: 1.8 }

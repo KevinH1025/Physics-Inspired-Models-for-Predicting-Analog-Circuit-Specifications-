@@ -1,0 +1,147 @@
+# Op-Amp 3-Stage Fan SMC Dataset Configuration
+# Folded-cascode input + common-source gain + push-pull output
+# Uses group-based parameters (shared W/L/M per device group)
+#
+# Usage:
+#   python scripts/generate_dataset.py \
+#     --config configs/opamp_dataset/opamp_3stage_fan_smc.yaml \
+#     --output-dir datasets/opamp_3stage_fan_smc_v1
+
+dataset:
+  name: opamp_3stage_fan_smc
+  template: netlists/opamp_3stage_fan_smc_template.sp
+  ac_template: netlists/opamp_3stage_fan_smc_ac_template.sp
+  description: Three-stage Fan SMC op-amp with folded-cascode input + push-pull output
+
+graph_encoding:
+  normalize_props: true
+
+# Device-to-group mapping for group-based normalization
+# Maps device IDs (without X prefix) to group parameter names
+device_to_group:
+  # PMOS bias mirrors (M0-M7)
+  M0: BIASCM_P
+  M1: BIASCM_P
+  M2: BIASCM_P
+  M3: BIASCM_P
+  M4: BIASCM_P
+  M5: BIASCM_P
+  M6: BIASCM_P
+  M7: BIASCM_P
+  # Stage 1: PMOS diff pair (M8-M9)
+  M8: GM1
+  M9: GM1
+  # Stage 2: PMOS common-source (M10)
+  M10: GM2
+  # Stage 3: PMOS output (M11)
+  M11: GMF2
+  # NMOS bias/cascode (M12-M20)
+  M12: BIASCM_N
+  M13: BIASCM_N
+  M14: BIASCM_N
+  M15: BIASCM_N
+  M16: BIASCM_N
+  M17: BIASCM_N
+  M18: BIASCM_N
+  M19: BIASCM_N
+  M20: BIASCM_N
+  # Stage 2 NMOS load (M21-M22)
+  M21: LOAD2
+  M22: LOAD2
+  # Stage 3: NMOS output (M23)
+  M23: GM3
+
+# Devices to exclude from current targets (voltage sources used for biasing)
+excluded_current_devices:
+  - vcm_ref
+  - lbreak      # AC analysis inductor (0A DC)
+  - vac_inj     # AC analysis injection source (0A DC)
+
+# Pre-batching configuration
+pre_batching:
+  enabled: true
+  batch_size: 1024
+  num_batching_variants: 10
+  seed: 42
+
+  # Split ratios
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88
+
+# Sampling configuration
+sampling:
+  method: lhs
+  total_samples: 5000
+  max_attempts_multiplier: 10.0
+  n_workers: 20
+  save_interval: 1000
+
+  filter:
+    enabled: false
+    rail_margin: 0.0
+    exclude_nodes:
+      - nbias     # PMOS bias reference (M0 diode gate)
+      - vb3       # NMOS gate bias (M14 diode)
+      - vb4       # NMOS cascode gate bias
+      - net31     # Diff pair tail node (M4 drain)
+      - net54     # VB4 generation internal
+      - net56     # DM_1 generation internal
+      - dm_1      # Cascode bias branch dump
+      - dm_2      # Left folded-cascode intermediate
+      - net063    # Right folded-cascode intermediate
+      - voutn     # CMFB reference node (M5 diode)
+    saturation_only: false
+
+  # Hard constraints — reject samples that violate these
+  # Uses effective width (W*M) to account for multiplier scaling
+  constraints:
+    - "W_GM3*M_GM3 >= W_GM2*M_GM2 >= W_GM1*M_GM1"  # gm scaling across stages
+    - "W_GMF2*M_GMF2 >= W_GM3*M_GM3"               # PMOS output >= NMOS output (lower µp)
+
+parameters:
+  # === MOSFET WIDTHS (log-scale, per finger) ===
+  # NOTE: SKY130 model bins cap at wmax=100µm per finger. Use M for wider effective widths.
+  W_BIASCM_P: { min: 2.0e-6, max: 20.0e-6, scale: log }    # PMOS bias mirrors (M0-M7) — min raised for M0 Vov headroom
+  W_BIASCM_N: { min: 0.5e-6, max: 10.0e-6, scale: log }    # NMOS bias/cascode (M12-M20) — max capped for M14 Vov
+  W_GM1:      { min: 1.0e-6, max: 50.0e-6, scale: log }    # Diff pair (M8-M9)
+  W_GM2:      { min: 2.0e-6, max: 50.0e-6, scale: log }    # Stage 2 gain (M10)
+  W_GM3:      { min: 5.0e-6, max: 50.0e-6, scale: log }    # Stage 3 NMOS output (M23)
+  W_GMF2:     { min: 5.0e-6, max: 50.0e-6, scale: log }    # Stage 3 PMOS output (M11)
+  W_LOAD2:    { min: 1.0e-6, max: 50.0e-6, scale: log }    # Stage 2 load (M21-M22)
+
+  # === MOSFET LENGTHS (log-scale) ===
+  # Bias + load: long L for matching and high Rout (0.5-2µm)
+  L_BIASCM_P: { min: 0.5e-6, max: 2.0e-6, scale: log }
+  L_BIASCM_N: { min: 0.5e-6, max: 2.0e-6, scale: log }
+  L_LOAD2:    { min: 0.5e-6, max: 2.0e-6, scale: log }
+  # Signal path: short L for high gm and speed (0.15-0.5µm)
+  L_GM1:      { min: 0.15e-6, max: 0.5e-6, scale: log }
+  L_GM2:      { min: 0.15e-6, max: 0.5e-6, scale: log }
+  L_GM3:      { min: 0.15e-6, max: 0.5e-6, scale: log }
+  L_GMF2:     { min: 0.15e-6, max: 0.5e-6, scale: log }
+
+  # === MOSFET MULTIPLIERS (linear, integer) ===
+  # Note: some devices have additional hardcoded multipliers in the netlist
+  # (M4=4x, M19/M20=8x, M15/M16/M12/M17/M18/M13=4x)
+  M_BIASCM_P: { min: 1, max: 4, scale: linear, type: int }   # eff M4 tail: up to 16
+  M_BIASCM_N: { min: 1, max: 4, scale: linear, type: int }   # eff M19/M20: up to 32
+  M_GM1:      { min: 1, max: 10, scale: linear, type: int }   # eff diff pair: up to 500µm
+  M_GM2:      { min: 1, max: 20, scale: linear, type: int }   # eff stage 2: up to 1000µm
+  M_GM3:      { min: 1, max: 20, scale: linear, type: int }   # eff NMOS out: up to 1000µm
+  M_GMF2:     { min: 1, max: 20, scale: linear, type: int }   # eff PMOS out: up to 1000µm
+  M_LOAD2:    { min: 1, max: 10, scale: linear, type: int }   # eff load: up to 500µm
+
+  # === BIAS CURRENT & COMPENSATION ===
+  I_BIAS: { min: 2.0e-6, max: 30.0e-6, scale: log }        # min 2µA for NMOS bias, max 30µA for M0 Vov headroom
+  C_COMP: { min: 0.5e-12, max: 30.0e-12, scale: log }
+
+  # === OPERATING POINT ===
+  VCM:   { min: 0.7, max: 0.9, scale: linear }              # capped at 0.9V for PMOS folded-cascode headroom
+  VDIFF: { min: -0.05, max: 0.05, scale: linear }
+
+  # === FIXED PARAMETERS ===
+  VDD:  { value: 1.8 }
+  R_IN: { value: 50000 }
+  R_F:  { value: 50000 }

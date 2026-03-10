@@ -1,0 +1,81 @@
+# Op-Amp 2-Stage Dataset Configuration (V3 - with gm/gds)
+# Regenerated dataset to include per-MOSFET small-signal parameters (gm, gds)
+# from SPICE AC analysis.
+#
+# Usage:
+#   python scripts/generate_dataset.py \
+#     --config configs/opamp_dataset/opamp_dataset_v3_ss.yaml \
+#     --output-dir datasets/opamp_5k_ss_v1
+
+dataset:
+  name: opamp_2stage_v3_ss
+  template: netlists/opamp_2stage_perdevice_template.sp
+  ac_template: netlists/opamp_2stage_perdevice_ac_template.sp
+  description: Two-stage op-amp with Miller compensation + gm/gds small-signal params
+
+graph_encoding:
+  normalize_props: true
+
+# Pre-batching configuration
+pre_batching:
+  enabled: true
+  batch_size: 1024           # Match original dataset
+  num_batching_variants: 10
+  seed: 42
+
+  # Split ratios (same as original 80/20)
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88
+
+# Sampling configuration
+sampling:
+  method: lhs
+  total_samples: 5000        # Same as original dataset
+  max_attempts_multiplier: 10.0
+  n_workers: 20
+  save_interval: 1000
+
+  filter:
+    enabled: false
+    rail_margin: 0.0
+    exclude_nodes:
+      - tail
+      - nbias
+    saturation_only: false
+
+parameters:
+  # === MOSFET WIDTHS (log-scale) ===
+  W_M1: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M2: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M3: { min: 1.0e-6, max: 100.0e-6, scale: log }
+  W_M4: { min: 1.0e-6, max: 100.0e-6, scale: log }
+  W_M5: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M6: { min: 5.0e-6, max: 200.0e-6, scale: log }
+  W_M7: { min: 5.0e-6, max: 200.0e-6, scale: log }
+  W_M8: { min: 1.0e-6, max: 50.0e-6, scale: log }
+
+  # === MOSFET LENGTHS (log-scale) ===
+  L_M1: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M2: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M3: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M4: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M5: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M6: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M7: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M8: { min: 0.15e-6, max: 1.0e-6, scale: log }
+
+  # === BIAS & SIGNAL (linear scale) ===
+  VCM: { min: 0.7, max: 1.1, scale: linear }
+  VDIFF: { min: -0.1, max: 0.1, scale: linear }
+  I_REF: { min: 5.0e-6, max: 50.0e-6, scale: log }
+
+  # === PASSIVE COMPONENTS (log-scale) ===
+  C_C: { min: 0.5e-12, max: 5.0e-12, scale: log }
+  R_Z: { min: 100, max: 10000, scale: log }
+  R_IN: { min: 10000, max: 100000, scale: log }
+  R_F: { min: 10000, max: 100000, scale: log }
+
+  # === FIXED PARAMETERS ===
+  VDD: { value: 1.8 }

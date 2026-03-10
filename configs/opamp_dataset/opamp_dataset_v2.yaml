@@ -1,0 +1,82 @@
+# Op-Amp 2-Stage Dataset Configuration (V2)
+# For use with generate_dataset.py
+
+dataset:
+  name: opamp_2stage_v2
+  template: netlists/opamp_2stage_template.sp
+  ac_template: netlists/opamp_2stage_ac_template.sp
+  description: Two-stage op-amp with Miller compensation
+
+graph_encoding:
+  normalize_props: true
+
+# Pre-batching configuration (optional - for training speedup)
+# NOTE: Pre-batching requires train/val/test splits
+pre_batching:
+  enabled: true  # Set to true to enable pre-batching AND splits
+  batch_size: 256  # Batch size for pre-batching (should match training batch_size)
+  num_batching_variants: 10  # Number of different batch groupings (shuffled with different seeds)
+  seed: 42  # Base random seed for batching (each variant uses seed + variant_id)
+  
+  # Split ratios
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88  # Random seed for split (reproducibility)
+
+# Sampling configuration
+sampling:
+  method: lhs  # Latin Hypercube Sampling
+  total_samples: 1000
+  max_attempts_multiplier: 10.0  # Higher multiplier for saturation filter (few samples pass)
+  n_workers: 20
+  save_interval: 1000  # Save every N valid samples (lower for low-yield filters like saturation_only)
+  
+  # Filter configuration - discard samples with signal nodes near rails
+  filter:
+    enabled: false
+    rail_margin: 0.0  # No filtering - include all operating regions
+    # Nodes to exclude from rail check (expected to be near rails)
+    exclude_nodes:
+      - tail      # Tail current source node (expected near GND)
+      - nbias     # Bias voltage node (can be near GND for current mirrors)
+    # Saturation filter: only keep samples where ALL MOSFETs are in saturation
+    # This creates a "clean" dataset of properly-biased op-amps
+    # Uses textbook criterion: |Vds| >= |Vdsat| for each MOSFET
+    saturation_only: false
+
+parameters:
+  # === MOSFET WIDTHS (log-scale) ===
+  W_M1: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M2: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M3: { min: 1.0e-6, max: 100.0e-6, scale: log }
+  W_M4: { min: 1.0e-6, max: 100.0e-6, scale: log }
+  W_M5: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M6: { min: 5.0e-6, max: 200.0e-6, scale: log }
+  W_M7: { min: 5.0e-6, max: 200.0e-6, scale: log }
+  W_M8: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  
+  # === MOSFET LENGTHS (log-scale) ===
+  L_M1: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M2: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M3: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M4: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M5: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M6: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M7: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M8: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  
+  # === BIAS & SIGNAL (linear scale) ===
+  # VIN_P = VCM + VDIFF/2, VIN_N = VCM - VDIFF/2
+  VCM: { min: 0.7, max: 1.1, scale: linear }
+  VDIFF: { min: -0.1, max: 0.1, scale: linear }
+  I_REF: { min: 5.0e-6, max: 50.0e-6, scale: log }
+  
+  # === PASSIVE COMPONENTS (log-scale) ===
+  C_C: { min: 0.5e-12, max: 5.0e-12, scale: log }
+  R_Z: { min: 100, max: 10000, scale: log }
+  R_IN: { min: 10000, max: 100000, scale: log }
+  R_F: { min: 10000, max: 100000, scale: log }
+  
+  # === FIXED PARAMETERS ===
+  VDD: { value: 1.8 }

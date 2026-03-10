@@ -1,0 +1,79 @@
+# Op-Amp 2-Stage Dataset Configuration - SATURATION ONLY
+# Creates a "clean" dataset with only properly-biased op-amps
+# All MOSFETs guaranteed to be in saturation mode
+#
+# For use with generate_dataset.py
+
+dataset:
+  name: opamp_2stage_saturation
+  template: netlists/opamp_2stage_template.sp
+  description: Two-stage op-amp - saturation only (properly biased circuits)
+
+graph_encoding:
+  normalize_props: true
+
+# Pre-batching configuration (optional - for training speedup)
+pre_batching:
+  enabled: true
+  batch_size: 1024
+  num_batching_variants: 10
+  seed: 42
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88
+
+# Sampling configuration
+sampling:
+  method: lhs  # Latin Hypercube Sampling
+  total_samples: 30000
+  max_attempts_multiplier: 10.0  # Higher multiplier since saturation filter is strict
+  n_workers: 20
+  save_interval: 200  # Save every N valid samples (lower for low-yield filters like saturation_only)
+
+  # Filter configuration
+  filter:
+    enabled: false  # Rail filter disabled (saturation filter is stricter)
+    rail_margin: 0.0
+    exclude_nodes:
+      - tail
+      - nbias
+    # SATURATION FILTER ENABLED - only keeps samples where ALL MOSFETs are in saturation
+    # This is the textbook criterion for a working amplifier
+    saturation_only: true
+
+parameters:
+  # === MOSFET WIDTHS (log-scale) ===
+  W_M1: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M2: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M3: { min: 1.0e-6, max: 100.0e-6, scale: log }
+  W_M4: { min: 1.0e-6, max: 100.0e-6, scale: log }
+  W_M5: { min: 1.0e-6, max: 50.0e-6, scale: log }
+  W_M6: { min: 5.0e-6, max: 200.0e-6, scale: log }
+  W_M7: { min: 5.0e-6, max: 200.0e-6, scale: log }
+  W_M8: { min: 1.0e-6, max: 50.0e-6, scale: log }
+
+  # === MOSFET LENGTHS (log-scale) ===
+  L_M1: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M2: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M3: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M4: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M5: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M6: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M7: { min: 0.15e-6, max: 1.0e-6, scale: log }
+  L_M8: { min: 0.15e-6, max: 1.0e-6, scale: log }
+
+  # === BIAS & SIGNAL (linear scale) ===
+  # Tighter ranges to increase saturation yield
+  VCM: { min: 0.8, max: 1.0, scale: linear }  # Narrower range for better biasing
+  VDIFF: { min: -0.05, max: 0.05, scale: linear }  # Smaller diff to avoid railing output
+  I_REF: { min: 10.0e-6, max: 40.0e-6, scale: log }  # Moderate bias current
+
+  # === PASSIVE COMPONENTS (log-scale) ===
+  C_C: { min: 0.5e-12, max: 5.0e-12, scale: log }
+  R_Z: { min: 100, max: 10000, scale: log }
+  R_IN: { min: 10000, max: 100000, scale: log }
+  R_F: { min: 10000, max: 100000, scale: log }
+
+  # === FIXED PARAMETERS ===
+  VDD: { value: 1.8 }

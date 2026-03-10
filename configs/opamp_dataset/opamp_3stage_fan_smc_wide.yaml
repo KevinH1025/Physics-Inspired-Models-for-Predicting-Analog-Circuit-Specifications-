@@ -1,0 +1,146 @@
+# Op-Amp 3-Stage Fan SMC Dataset Configuration — WIDE RANGES
+# Matches parameter ranges from CktGNN paper (Table I)
+# L: 0.15-20µm, W: 0.42-50µm, M: 1-100, I_BIAS: 0.5-100µA
+# VDD/Temp/Corners unchanged (fixed at 1.8V, room temp, TT)
+#
+# Usage:
+#   python scripts/generate_dataset.py \
+#     --config configs/opamp_dataset/opamp_3stage_fan_smc_wide.yaml \
+#     --output-dir datasets/opamp_3stage_fan_smc_v4
+
+dataset:
+  name: opamp_3stage_fan_smc
+  template: netlists/opamp_3stage_fan_smc_template.sp
+  ac_template: netlists/opamp_3stage_fan_smc_ac_template.sp
+  description: Three-stage Fan SMC op-amp — wide parameter ranges
+
+graph_encoding:
+  normalize_props: true
+
+# Device-to-group mapping for group-based normalization
+device_to_group:
+  # PMOS bias mirrors (M0-M7)
+  M0: BIASCM_P
+  M1: BIASCM_P
+  M2: BIASCM_P
+  M3: BIASCM_P
+  M4: BIASCM_P
+  M5: BIASCM_P
+  M6: BIASCM_P
+  M7: BIASCM_P
+  # Stage 1: PMOS diff pair (M8-M9)
+  M8: GM1
+  M9: GM1
+  # Stage 2: PMOS common-source (M10)
+  M10: GM2
+  # Stage 3: PMOS output (M11)
+  M11: GMF2
+  # NMOS bias/cascode (M12-M20)
+  M12: BIASCM_N
+  M13: BIASCM_N
+  M14: BIASCM_N
+  M15: BIASCM_N
+  M16: BIASCM_N
+  M17: BIASCM_N
+  M18: BIASCM_N
+  M19: BIASCM_N
+  M20: BIASCM_N
+  # Stage 2 NMOS load (M21-M22)
+  M21: LOAD2
+  M22: LOAD2
+  # Stage 3: NMOS output (M23)
+  M23: GM3
+
+# Devices to exclude from current targets (voltage sources used for biasing)
+excluded_current_devices:
+  - vcm_ref
+  - lbreak
+  - vac_inj
+
+# Pre-batching configuration
+pre_batching:
+  enabled: true
+  batch_size: 1024
+  num_batching_variants: 10
+  seed: 42
+
+  # Split ratios
+  train: 0.8
+  val: 0.2
+  test: 0.0
+  split_seed: 88
+
+# Sampling configuration
+sampling:
+  method: lhs
+  total_samples: 5000
+  max_attempts_multiplier: 10.0
+  n_workers: 20
+  save_interval: 1000
+
+  filter:
+    enabled: true
+    rail_margin: 0.0
+    exclude_nodes:
+      - nbias
+      - vb3
+      - vb4
+      - net31
+      - net54
+      - net56
+      - dm_1
+      - dm_2
+      - net063
+      - voutn
+    saturation_only: false
+
+  # Constraints removed — with wide ranges, let SPICE reject non-convergent designs
+  # Original constraints were too restrictive for wide parameter exploration
+  constraints: []
+
+parameters:
+  # === MOSFET WIDTHS (log-scale, per finger) ===
+  # Paper: 220nm-50µm. SKY130 wmin=0.42µm for nfet/pfet_01v8.
+  W_BIASCM_P: { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_BIASCM_N: { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GM1:      { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GM2:      { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GM3:      { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_GMF2:     { min: 0.42e-6, max: 50.0e-6, scale: log }
+  W_LOAD2:    { min: 0.42e-6, max: 50.0e-6, scale: log }
+
+  # === MOSFET LENGTHS (log-scale) ===
+  # Paper: 180nm-20µm. SKY130 lmin=0.15µm.
+  L_BIASCM_P: { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_BIASCM_N: { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GM1:      { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GM2:      { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GM3:      { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_GMF2:     { min: 0.15e-6, max: 20.0e-6, scale: log }
+  L_LOAD2:    { min: 0.15e-6, max: 20.0e-6, scale: log }
+
+  # === MOSFET MULTIPLIERS (log-scale, integer) ===
+  # Paper: 1-1000. Using 1-100 since netlist has hardcoded multipliers:
+  # M4=4x, M19/M20=8x, M15-M18/M12-M13=4x
+  # Effective range with hardcoded: up to 400 (PMOS) / 800 (NMOS)
+  M_BIASCM_P: { min: 1, max: 100, scale: log, type: int }
+  M_BIASCM_N: { min: 1, max: 100, scale: log, type: int }
+  M_GM1:      { min: 1, max: 100, scale: log, type: int }
+  M_GM2:      { min: 1, max: 100, scale: log, type: int }
+  M_GM3:      { min: 1, max: 100, scale: log, type: int }
+  M_GMF2:     { min: 1, max: 100, scale: log, type: int }
+  M_LOAD2:    { min: 1, max: 100, scale: log, type: int }
+
+  # === BIAS CURRENT & COMPENSATION ===
+  # Paper: 0.5-100µA
+  I_BIAS: { min: 0.5e-6, max: 100.0e-6, scale: log }
+  C_COMP: { min: 0.5e-12, max: 30.0e-12, scale: log }
+
+  # === OPERATING POINT ===
+  VCM:   { min: 0.7, max: 0.9, scale: linear }
+  VDIFF: { min: -0.05, max: 0.05, scale: linear }
+
+  # === FIXED PARAMETERS ===
+  VDD:  { value: 1.8 }
+  R_IN: { value: 50000 }
+  R_F:  { value: 50000 }

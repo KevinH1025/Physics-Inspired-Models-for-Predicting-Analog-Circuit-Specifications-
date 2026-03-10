@@ -1,0 +1,32 @@
+# Datasets (16GB of pickle files)
+datasets/
+
+# Training logs
+*.log
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / editor
+.vscode/
+
+# Claude Code local settings
+.claude/
+claude.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated plots
+plots/
+
+# PyTorch checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# SPICE simulation outputs
+*.out
