@@ -38,6 +38,11 @@ def create_model(
     current_gnn_config=None,
     use_frozen_device_mlp=False,
     frozen_device_mlp_config=None,
+    use_device_pooling_current=False,
+    device_aggregation_config=None,
+    intermediate_voltage_config=None,
+    use_edge_features=False,
+    input_dropout=0.0,
     use_refinement_pass=False,
     refinement_config=None,
     ac_head_config=None,
@@ -118,6 +123,15 @@ def create_model(
         # Frozen Device MLP options
         use_frozen_device_mlp=use_frozen_device_mlp,
         frozen_device_mlp_config=frozen_device_mlp_config or {},
+        # Device-level pooling current head
+        use_device_pooling_current=use_device_pooling_current,
+        # Device aggregation layer
+        device_aggregation_config=device_aggregation_config or {},
+        # Intermediate voltage prediction
+        intermediate_voltage_config=intermediate_voltage_config or {},
+        # Edge features
+        use_edge_features=use_edge_features,
+        input_dropout=input_dropout,
         # Refinement pass options
         use_refinement_pass=use_refinement_pass,
         refinement_config=refinement_config or {},
@@ -183,6 +197,11 @@ def create_model_from_args(args, input_dim, device='cuda'):
         current_gnn_config=getattr(args, 'current_gnn_config', {}),
         use_frozen_device_mlp=getattr(args, 'use_frozen_device_mlp', False),
         frozen_device_mlp_config=getattr(args, 'frozen_device_mlp_config', {}),
+        use_device_pooling_current=getattr(args, 'use_device_pooling_current', False),
+        device_aggregation_config=getattr(args, 'device_aggregation_config', {}),
+        intermediate_voltage_config=getattr(args, 'intermediate_voltage_config', {}),
+        use_edge_features=getattr(args, 'use_edge_features', False),
+        input_dropout=getattr(args, 'input_dropout', 0.0),
         use_refinement_pass=getattr(args, 'use_refinement_pass', False),
         refinement_config=getattr(args, 'refinement_config', {}),
         ac_head_config=getattr(args, 'ac_head_config', {}),
@@ -352,6 +371,8 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         ac_head_config=config.get('ac_head_config', {}),
         ss_head_config=config.get('ss_head_config', {}),
         region_head_config=config.get('region_head_config', {}),
+        device_aggregation_config=config.get('device_aggregation_config',
+            {'enabled': True} if any('device_agg.' in k for k in state_dict.keys()) else {}),
     )
 
     # Load weights and move to device

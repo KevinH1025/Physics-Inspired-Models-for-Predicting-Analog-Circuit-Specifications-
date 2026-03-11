@@ -9,14 +9,12 @@ This module provides building blocks for constructing GNN architectures:
 """
 
 from .layers import build_mlp, create_deepgcn_layer
-from .aggregation import JumpingKnowledge
 from .virtual_node import VirtualNode
 from .current_from_voltage import MOSFETCurrentMLP, compute_mosfet_currents
 
 __all__ = [
     'build_mlp',
     'create_deepgcn_layer',
-    'JumpingKnowledge',
     'VirtualNode',
     'MOSFETCurrentMLP',
     'compute_mosfet_currents',

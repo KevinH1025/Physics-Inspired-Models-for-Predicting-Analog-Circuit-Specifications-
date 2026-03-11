@@ -72,6 +72,27 @@ def generate_lhs_samples(param_specs: Dict, num_samples: int, seed: int = 42) ->
     return all_params
 
 
+def generate_random_params(param_specs: Dict) -> Dict:
+    """Generate a single random parameter sample (uniform in specified scale)."""
+    params = {}
+    for name, spec in param_specs.items():
+        if 'value' in spec:
+            params[name] = spec['value']
+        elif 'min' in spec and 'max' in spec:
+            min_val, max_val = spec['min'], spec['max']
+            scale = spec.get('scale', 'linear')
+            u = np.random.random()
+            if scale == 'log':
+                log_min = np.log10(max(min_val, 1e-15))
+                log_max = np.log10(max_val)
+                params[name] = 10 ** (log_min + u * (log_max - log_min))
+            else:
+                params[name] = min_val + u * (max_val - min_val)
+            if spec.get('type') == 'int':
+                params[name] = int(round(params[name]))
+    return params
+
+
 def generate_netlist(template_path: str, params: Dict, output_path: str) -> str:
     """Generate netlist from template with given parameters."""
     with open(template_path, 'r') as f:

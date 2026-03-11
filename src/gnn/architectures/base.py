@@ -73,4 +73,6 @@ class BaseGNN(nn.Module, ABC):
             x = torch.cat([x, data.type_tens], dim=-1)
         if hasattr(data, 'net_type') and data.net_type is not None:
             x = torch.cat([x, data.net_type], dim=-1)
+        if hasattr(data, 'structural_pe') and data.structural_pe is not None:
+            x = torch.cat([x, data.structural_pe], dim=-1)
         return x

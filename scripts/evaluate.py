@@ -89,9 +89,10 @@ def evaluate_model(model, data_path, split, stats, config, device):
         huber_delta=huber_delta
     )
 
-    # Unpack results
+    # Unpack results (must match validate() return signature)
     (avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua,
-     acc80, acc50, acc20, current_acc50, current_acc20, current_acc5) = results
+     acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5,
+     avg_kcl_loss, *_rest) = results
 
     return {
         'loss': avg_loss,
@@ -102,8 +103,10 @@ def evaluate_model(model, data_path, split, stats, config, device):
         'acc80': acc80,
         'acc50': acc50,
         'acc20': acc20,
+        'acc10': acc10,
         'current_acc50': current_acc50,
         'current_acc20': current_acc20,
+        'current_acc10': current_acc10,
         'current_acc5': current_acc5,
         'predict_currents': predict_currents,
     }
@@ -125,9 +128,10 @@ def print_results(metrics, split):
     if metrics['predict_currents']:
         print(f"\nCurrent Prediction:")
         print(f"  MAE: {metrics['current_mae_ua']:.2f} µA")
-        print(f"  Accuracy @50µA: {metrics['current_acc50']:.1f}%")
-        print(f"  Accuracy @20µA: {metrics['current_acc20']:.1f}%")
-        print(f"  Accuracy @5µA: {metrics['current_acc5']:.1f}%")
+        print(f"  Accuracy @50%: {metrics['current_acc50']:.1f}%")
+        print(f"  Accuracy @20%: {metrics['current_acc20']:.1f}%")
+        print(f"  Accuracy @10%: {metrics['current_acc10']:.1f}%")
+        print(f"  Accuracy @5%: {metrics['current_acc5']:.1f}%")
         print(f"  Loss (MSE): {metrics['current_loss']:.6f}")
 
     print(f"\nCombined Loss: {metrics['loss']:.6f}")

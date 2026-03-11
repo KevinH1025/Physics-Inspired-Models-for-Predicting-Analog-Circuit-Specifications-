@@ -13,7 +13,6 @@ from src.data.encoding import Trie, build_circuit_trie
 from src.data.graph_builder import CircuitGraphBuilder, TerminalNode, NetNode
 from src.data.sampling import (
     generate_lhs_samples,
-    generate_random_params,
     generate_netlist,
     worker_generate_sample,
 )
@@ -36,7 +35,6 @@ __all__ = [
     'NetNode',
     # Sampling
     'generate_lhs_samples',
-    'generate_random_params',
     'generate_netlist',
     'worker_generate_sample',
     # Batching

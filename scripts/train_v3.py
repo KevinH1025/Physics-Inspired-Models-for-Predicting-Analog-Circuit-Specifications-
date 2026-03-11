@@ -423,8 +423,9 @@ def main():
     x_dim = sample_batch.x.shape[1]
     type_dim = sample_batch.type_tens.shape[1]
     net_type_dim = sample_batch.net_type.shape[1] if hasattr(sample_batch, 'net_type') and sample_batch.net_type is not None else 0
-    total_input_dim = x_dim + type_dim + net_type_dim
-    print(f"Input features: {total_input_dim} (x={x_dim}, type={type_dim}, net={net_type_dim})")
+    spe_dim = sample_batch.structural_pe.shape[1] if hasattr(sample_batch, 'structural_pe') and sample_batch.structural_pe is not None else 0
+    total_input_dim = x_dim + type_dim + net_type_dim + spe_dim
+    print(f"Input features: {total_input_dim} (x={x_dim}, type={type_dim}, net={net_type_dim}, spe={spe_dim})")
 
     # Fine-tune: override architecture args from checkpoint config so model matches exactly
     if getattr(args, 'finetune', False):
@@ -662,7 +663,7 @@ def main():
     train_maes, train_current_maes, val_current_maes, learning_rates = [], [], [], []
     epochs_without_improvement = 0
     best_model_state = None
-    best_metrics = {'val_mae_mv': float('inf'), 'val_current_mae_ua': 0.0, 'acc80': 0.0, 'acc50': 0.0, 'acc20': 0.0, 'acc10': 0.0, 'current_acc50': 0.0, 'current_acc20': 0.0, 'current_acc5': 0.0, 'current_acc2': 0.0}
+    best_metrics = {'val_mae_mv': float('inf'), 'val_current_mae_ua': 0.0, 'acc80': 0.0, 'acc50': 0.0, 'acc20': 0.0, 'acc10': 0.0, 'current_acc50': 0.0, 'current_acc20': 0.0, 'current_acc10': 0.0, 'current_acc5': 0.0}
 
     early_stopping_patience = getattr(args, 'early_stopping_patience', 80)
     val_freq = getattr(args, 'val_freq', 1)
@@ -717,6 +718,9 @@ def main():
     cutoff_physics_loss_start_epoch_cfg = getattr(args, 'cutoff_physics_loss_start_epoch', 0)
     cutoff_physics_n_nmos = getattr(args, 'cutoff_physics_n_nmos', 1.5)
     cutoff_physics_n_pmos = getattr(args, 'cutoff_physics_n_pmos', 2.0)
+
+    # Device consistency loss config
+    device_consistency_weight = getattr(args, 'device_consistency_weight', 0.0)
 
     # Region classification loss config
     region_loss_weight_target = getattr(args, 'region_loss_weight', 0.0)
@@ -920,6 +924,8 @@ def main():
             kcl_conservation=kcl_conservation,
             kcl_skip_two_term=kcl_skip_two_term,
             kcl_only_two_term=kcl_only_two_term,
+            device_consistency_weight=device_consistency_weight,
+            intermediate_v_weight=getattr(args, 'intermediate_v_weight', 0.0),
         )
 
         mae_mv = mae_norm * vdc_std * 1000
@@ -939,7 +945,7 @@ def main():
 
         # Validation
         if val_loader and epoch % val_freq == 0:
-            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc5, current_acc2, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss = validate(
+            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss = validate(
                 model, val_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                 predict_currents=predict_currents, current_weight=current_weight, kcl_weight=kcl_weight,
                 loss_type=loss_type, huber_delta=huber_delta, kcl_min_current=kcl_min_current,
@@ -964,6 +970,7 @@ def main():
                 kcl_skip_two_term=kcl_skip_two_term,
                 kcl_only_two_term=kcl_only_two_term,
                 amp_dtype=amp_dtype,
+                device_consistency_weight=device_consistency_weight,
             )
 
             val_losses.append(val_loss)
@@ -987,7 +994,7 @@ def main():
                 best_model_state = model.state_dict()
                 epochs_without_improvement = 0
                 best_metrics.update(val_mae_mv=val_mae_mv, val_current_mae_ua=val_c_mae, acc80=acc80, acc50=acc50, acc20=acc20, acc10=acc10,
-                                     current_acc50=current_acc50, current_acc20=current_acc20, current_acc5=current_acc5, current_acc2=current_acc2)
+                                     current_acc50=current_acc50, current_acc20=current_acc20, current_acc10=current_acc10, current_acc5=current_acc5)
             else:
                 epochs_without_improvement += 1
 
@@ -1016,7 +1023,7 @@ def main():
 
             # Detailed progress every 50 epochs
             if epoch > 0 and epoch % 50 == 0:
-                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc5, tr_current_acc2, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss = validate(
+                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss = validate(
                     model, train_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                     predict_currents=predict_currents, current_weight=current_weight, kcl_weight=kcl_weight,
                     loss_type=loss_type, huber_delta=huber_delta, constraint_weight=constraint_weight,
@@ -1031,6 +1038,7 @@ def main():
                     cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
                     region_loss_weight=region_loss_weight,
                     amp_dtype=amp_dtype,
+                    device_consistency_weight=device_consistency_weight,
                 )
                 # Build rows dynamically: (label, train_value, val_value)
                 rows = []
@@ -1038,7 +1046,7 @@ def main():
                 rows.append(("  Acc", f"@80={tr_acc80:.0f}% @50={tr_acc50:.0f}% @20={tr_acc20:.0f}% @10={tr_acc10:.0f}%", f"@80={acc80:.0f}% @50={acc50:.0f}% @20={acc20:.0f}% @10={acc10:.0f}%"))
                 if predict_currents:
                     rows.append(("Current", f"Loss={tr_c_loss:.5f}  MAE={tr_c_mae:.1f}uA", f"Loss={val_c_loss:.5f}  MAE={val_c_mae:.1f}uA"))
-                    rows.append(("  Acc", f"@50={tr_current_acc50:.0f}% @20={tr_current_acc20:.0f}% @5={tr_current_acc5:.0f}% @2={tr_current_acc2:.0f}%", f"@50={current_acc50:.0f}% @20={current_acc20:.0f}% @5={current_acc5:.0f}% @2={current_acc2:.0f}%"))
+                    rows.append(("  Acc", f"@50%={tr_current_acc50:.0f}% @20%={tr_current_acc20:.0f}% @10%={tr_current_acc10:.0f}% @5%={tr_current_acc5:.0f}%", f"@50%={current_acc50:.0f}% @20%={current_acc20:.0f}% @10%={current_acc10:.0f}% @5%={current_acc5:.0f}%"))
                 if predict_currents:
                     rows.append(("KCL", f"{tr_kcl_loss:.2e}", f"{val_kcl_loss:.2e}"))
                     # KCL diagnostics: per-component breakdown, GT floor, drop stats
@@ -1091,7 +1099,7 @@ def main():
                     rows.append(("SS", f"{tr_ss_loss:.2e}", f"{val_ss_loss:.2e}"))
                     # SS accuracy on train and val
                     def _eval_ss(loader):
-                        _gm_e, _gds_e = [], []
+                        _gm_e, _gds_e, _gm_rel, _gds_rel = [], [], [], []
                         with torch.no_grad():
                             for _b in loader:
                                 if hasattr(_b, 'to'):
@@ -1101,14 +1109,21 @@ def main():
                                 if _gm_p is None: break
                                 _m = getattr(_b, 'mosfet_drain_mask', None)
                                 if _m is not None and _m.any():
-                                    _gm_e.extend((_gm_p[_m] * ss_gm_std + ss_gm_mean - (_b.node_log_gm[_m] * ss_gm_std + ss_gm_mean)).abs().cpu().tolist())
-                                    _gds_e.extend((_gds_p[_m] * ss_gds_std + ss_gds_mean - (_b.node_log_gds[_m] * ss_gds_std + ss_gds_mean)).abs().cpu().tolist())
-                        return np.array(_gm_e) if _gm_e else None, np.array(_gds_e) if _gds_e else None
-                    _tr_gm, _tr_gds = _eval_ss(train_loader)
-                    _vl_gm, _vl_gds = _eval_ss(val_loader)
+                                    gm_pred_log = _gm_p[_m] * ss_gm_std + ss_gm_mean
+                                    gm_tgt_log = _b.node_log_gm[_m] * ss_gm_std + ss_gm_mean
+                                    gds_pred_log = _gds_p[_m] * ss_gds_std + ss_gds_mean
+                                    gds_tgt_log = _b.node_log_gds[_m] * ss_gds_std + ss_gds_mean
+                                    _gm_e.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
+                                    _gds_e.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
+                                    _gm_rel.extend(((10**gm_pred_log - 10**gm_tgt_log).abs() / (10**gm_tgt_log).clamp(min=1e-15) * 100).cpu().tolist())
+                                    _gds_rel.extend(((10**gds_pred_log - 10**gds_tgt_log).abs() / (10**gds_tgt_log).clamp(min=1e-15) * 100).cpu().tolist())
+                        return (np.array(_gm_e) if _gm_e else None, np.array(_gds_e) if _gds_e else None,
+                                np.array(_gm_rel) if _gm_rel else None, np.array(_gds_rel) if _gds_rel else None)
+                    _tr_gm, _tr_gds, _tr_gm_r, _tr_gds_r = _eval_ss(train_loader)
+                    _vl_gm, _vl_gds, _vl_gm_r, _vl_gds_r = _eval_ss(val_loader)
                     if _vl_gm is not None:
-                        rows.append(("  gm", f"MAE={_tr_gm.mean():.3f}log  1.5x={100*np.mean(_tr_gm<np.log10(1.5)):.0f}%  2x={100*np.mean(_tr_gm<np.log10(2)):.0f}%", f"MAE={_vl_gm.mean():.3f}log  1.5x={100*np.mean(_vl_gm<np.log10(1.5)):.0f}%  2x={100*np.mean(_vl_gm<np.log10(2)):.0f}%"))
-                        rows.append(("  gds", f"MAE={_tr_gds.mean():.3f}log  1.5x={100*np.mean(_tr_gds<np.log10(1.5)):.0f}%  2x={100*np.mean(_tr_gds<np.log10(2)):.0f}%", f"MAE={_vl_gds.mean():.3f}log  1.5x={100*np.mean(_vl_gds<np.log10(1.5)):.0f}%  2x={100*np.mean(_vl_gds<np.log10(2)):.0f}%"))
+                        rows.append(("  gm", f"MAE={_tr_gm.mean():.3f}log  <10%={100*np.mean(_tr_gm_r<10):.0f}%  <20%={100*np.mean(_tr_gm_r<20):.0f}%  <50%={100*np.mean(_tr_gm_r<50):.0f}%", f"MAE={_vl_gm.mean():.3f}log  <10%={100*np.mean(_vl_gm_r<10):.0f}%  <20%={100*np.mean(_vl_gm_r<20):.0f}%  <50%={100*np.mean(_vl_gm_r<50):.0f}%"))
+                        rows.append(("  gds", f"MAE={_tr_gds.mean():.3f}log  <10%={100*np.mean(_tr_gds_r<10):.0f}%  <20%={100*np.mean(_tr_gds_r<20):.0f}%  <50%={100*np.mean(_tr_gds_r<50):.0f}%", f"MAE={_vl_gds.mean():.3f}log  <10%={100*np.mean(_vl_gds_r<10):.0f}%  <20%={100*np.mean(_vl_gds_r<20):.0f}%  <50%={100*np.mean(_vl_gds_r<50):.0f}%"))
                 if gm_physics_loss_weight > 0:
                     rows.append(("GmPhy", f"{tr_gm_physics_loss:.2e}", f"{val_gm_physics_loss:.2e}"))
                 if triode_physics_loss_weight > 0:
@@ -1153,6 +1168,7 @@ def main():
                     # AC accuracy on train and val
                     def _eval_ac(loader):
                         _errs = {c: [] for c in ac_components}
+                        _ugbw_rel = []
                         with torch.no_grad():
                             for _b in loader:
                                 if hasattr(_b, 'to'):
@@ -1166,19 +1182,21 @@ def main():
                                 for _i, _c in enumerate(ac_components):
                                     if _c == 'ugbw':
                                         _t = torch.log10(_b.ac_ugbw[_v].clamp(min=1.0).to(args.device))
+                                        _ugbw_rel.extend(((10**_pd[:, _i] - 10**_t).abs() / (10**_t).clamp(min=1e-15) * 100).cpu().tolist())
                                     elif _c == 'pm':
                                         _t = _b.ac_pm[_v].to(args.device)
                                     elif _c == 'am':
                                         _t = _b.ac_am[_v].to(args.device)
                                     _errs[_c].extend((_pd[:, _i] - _t).abs().cpu().tolist())
-                        return {c: np.array(v) for c, v in _errs.items() if v}
-                    _tr_ac = _eval_ac(train_loader)
-                    _vl_ac = _eval_ac(val_loader)
+                        return {c: np.array(v) for c, v in _errs.items() if v}, np.array(_ugbw_rel) if _ugbw_rel else None
+                    _tr_ac, _tr_ugbw_rel = _eval_ac(train_loader)
+                    _vl_ac, _vl_ugbw_rel = _eval_ac(val_loader)
                     for _c in ac_components:
                         if _c in _vl_ac:
                             _te, _ve = _tr_ac.get(_c, _vl_ac[_c]), _vl_ac[_c]
                             if _c == 'ugbw':
-                                rows.append(("  UGBW", f"MAE={_te.mean():.3f}log  1.5x={100*np.mean(_te<np.log10(1.5)):.0f}%  2x={100*np.mean(_te<np.log10(2)):.0f}%", f"MAE={_ve.mean():.3f}log  1.5x={100*np.mean(_ve<np.log10(1.5)):.0f}%  2x={100*np.mean(_ve<np.log10(2)):.0f}%"))
+                                _tr_ur = _tr_ugbw_rel if _tr_ugbw_rel is not None else _vl_ugbw_rel
+                                rows.append(("  UGBW", f"MAE={_te.mean():.3f}log  <10%={100*np.mean(_tr_ur<10):.0f}%  <20%={100*np.mean(_tr_ur<20):.0f}%  <50%={100*np.mean(_tr_ur<50):.0f}%", f"MAE={_ve.mean():.3f}log  <10%={100*np.mean(_vl_ugbw_rel<10):.0f}%  <20%={100*np.mean(_vl_ugbw_rel<20):.0f}%  <50%={100*np.mean(_vl_ugbw_rel<50):.0f}%"))
                             elif _c == 'pm':
                                 rows.append(("  PM", f"MAE={_te.mean():.1f}d  <5={100*np.mean(_te<5):.0f}%  <10={100*np.mean(_te<10):.0f}%", f"MAE={_ve.mean():.1f}d  <5={100*np.mean(_ve<5):.0f}%  <10={100*np.mean(_ve<10):.0f}%"))
                             elif _c == 'am':
@@ -1245,10 +1263,10 @@ def main():
     if predict_currents:
         print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA")
     if predict_currents:
-        print(f"Val Accuracy@80mV: {best_metrics['acc80']:5.2f}% | Current @50uA: {best_metrics['current_acc50']:5.2f}%")
-        print(f"Val Accuracy@50mV: {best_metrics['acc50']:5.2f}% | Current @20uA: {best_metrics['current_acc20']:5.2f}%")
-        print(f"Val Accuracy@20mV: {best_metrics['acc20']:5.2f}% | Current @5uA:  {best_metrics['current_acc5']:5.2f}%")
-        print(f"Val Accuracy@10mV: {best_metrics['acc10']:5.2f}% | Current @2uA:  {best_metrics['current_acc2']:5.2f}%")
+        print(f"Val Accuracy@80mV: {best_metrics['acc80']:5.2f}% | Current @50%: {best_metrics['current_acc50']:5.2f}%")
+        print(f"Val Accuracy@50mV: {best_metrics['acc50']:5.2f}% | Current @20%: {best_metrics['current_acc20']:5.2f}%")
+        print(f"Val Accuracy@20mV: {best_metrics['acc20']:5.2f}% | Current @10%: {best_metrics['current_acc10']:5.2f}%")
+        print(f"Val Accuracy@10mV: {best_metrics['acc10']:5.2f}% | Current @5%:  {best_metrics['current_acc5']:5.2f}%")
     else:
         print(f"Val Accuracy@80mV: {best_metrics['acc80']:.2f}%")
         print(f"Val Accuracy@50mV: {best_metrics['acc50']:.2f}%")
@@ -1264,6 +1282,8 @@ def main():
         if ss_loss_weight_target > 0 and has_ss:
             all_gm_errors = []
             all_gds_errors = []
+            all_gm_rel_errors = []
+            all_gds_rel_errors = []
             with torch.no_grad():
                 for batch in val_loader:
                     if hasattr(batch, 'to'):
@@ -1282,6 +1302,15 @@ def main():
                         gds_target_log = batch.node_log_gds[mask] * ss_gds_std + ss_gds_mean
                         all_gm_errors.extend((gm_pred_log - gm_target_log).abs().cpu().tolist())
                         all_gds_errors.extend((gds_pred_log - gds_target_log).abs().cpu().tolist())
+                        # Store linear-scale values for relative % error
+                        gm_pred_lin = torch.pow(10, gm_pred_log)
+                        gm_target_lin = torch.pow(10, gm_target_log)
+                        gds_pred_lin = torch.pow(10, gds_pred_log)
+                        gds_target_lin = torch.pow(10, gds_target_log)
+                        gm_rel = ((gm_pred_lin - gm_target_lin).abs() / gm_target_lin.clamp(min=1e-15) * 100).cpu().tolist()
+                        gds_rel = ((gds_pred_lin - gds_target_lin).abs() / gds_target_lin.clamp(min=1e-15) * 100).cpu().tolist()
+                        all_gm_rel_errors.extend(gm_rel)
+                        all_gds_rel_errors.extend(gds_rel)
 
             if all_gm_errors:
                 gm_errs = np.array(all_gm_errors)
@@ -1290,14 +1319,19 @@ def main():
                 print(f"\n--- SS Evaluation (best model, val set) ---")
                 print(f"  gm  MAE: {gm_errs.mean():.3f} log10  (median {np.median(gm_errs):.3f})")
                 print(f"  gds MAE: {gds_errs.mean():.3f} log10  (median {np.median(gds_errs):.3f})")
-                print(f"  gm  within 1.5x: {100*np.mean(gm_errs < np.log10(1.5)):.1f}%")
-                print(f"  gm  within 2x:   {100*np.mean(gm_errs < np.log10(2)):.1f}%")
-                print(f"  gds within 1.5x: {100*np.mean(gds_errs < np.log10(1.5)):.1f}%")
-                print(f"  gds within 2x:   {100*np.mean(gds_errs < np.log10(2)):.1f}%")
+                gm_rel = np.array(all_gm_rel_errors)
+                gds_rel = np.array(all_gds_rel_errors)
+                print(f"  gm  within 10%:  {100*np.mean(gm_rel < 10):.1f}%")
+                print(f"  gm  within 20%:  {100*np.mean(gm_rel < 20):.1f}%")
+                print(f"  gm  within 50%:  {100*np.mean(gm_rel < 50):.1f}%")
+                print(f"  gds within 10%:  {100*np.mean(gds_rel < 10):.1f}%")
+                print(f"  gds within 20%:  {100*np.mean(gds_rel < 20):.1f}%")
+                print(f"  gds within 50%:  {100*np.mean(gds_rel < 50):.1f}%")
 
         # AC evaluation: denormalized MAE in real units
         if ac_loss_weight_target > 0 and ac_mean is not None and ac_components:
             ac_errors = {comp: [] for comp in ac_components}
+            ac_rel_errors = {comp: [] for comp in ac_components}
             with torch.no_grad():
                 for batch in val_loader:
                     if hasattr(batch, 'to'):
@@ -1315,6 +1349,11 @@ def main():
                     for i, comp in enumerate(ac_components):
                         if comp == 'ugbw':
                             target = torch.log10(batch.ac_ugbw[valid].clamp(min=1.0).to(args.device))
+                            # Relative % error in linear Hz space
+                            pred_hz = torch.pow(10, pred_denorm[:, i])
+                            target_hz = torch.pow(10, target)
+                            rel_pct = (pred_hz - target_hz).abs() / target_hz.clamp(min=1e-15) * 100
+                            ac_rel_errors[comp].extend(rel_pct.cpu().tolist())
                         elif comp == 'pm':
                             target = batch.ac_pm[valid].to(args.device)
                         elif comp == 'am':
@@ -1327,8 +1366,10 @@ def main():
                     errs = np.array(ac_errors[comp])
                     if comp == 'ugbw':
                         print(f"  UGBW  MAE: {errs.mean():.3f} log10(Hz)  (median {np.median(errs):.3f})")
-                        print(f"  UGBW  within 1.5x: {100*np.mean(errs < np.log10(1.5)):.1f}%")
-                        print(f"  UGBW  within 2x:   {100*np.mean(errs < np.log10(2)):.1f}%")
+                        ugbw_rel = np.array(ac_rel_errors[comp])
+                        print(f"  UGBW  within 10%:  {100*np.mean(ugbw_rel < 10):.1f}%")
+                        print(f"  UGBW  within 20%:  {100*np.mean(ugbw_rel < 20):.1f}%")
+                        print(f"  UGBW  within 50%:  {100*np.mean(ugbw_rel < 50):.1f}%")
                     elif comp == 'pm':
                         print(f"  PM    MAE: {errs.mean():.1f} deg  (median {np.median(errs):.1f})")
                         print(f"  PM    within 5d:   {100*np.mean(errs < 5):.1f}%")

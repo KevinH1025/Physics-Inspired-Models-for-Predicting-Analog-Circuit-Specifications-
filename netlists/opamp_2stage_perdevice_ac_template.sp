@@ -165,6 +165,16 @@ Cload vout 0 10p
 .save @rfb[i]
 .save @rz[i]
 .save @iref[i]
+* Compensation network resistor
+.save @rbias_g[i]
+* Capacitor currents (0 DC but needed for KCL completeness)
+.save @cc[i]
+.save @cload[i]
+* Voltage source branch currents (for supply net KCL)
+.save vdd#branch
+.save vss#branch
+.save vcm_ref#branch
+.save vsig#branch
 
 * =========================
 * ANALYSIS

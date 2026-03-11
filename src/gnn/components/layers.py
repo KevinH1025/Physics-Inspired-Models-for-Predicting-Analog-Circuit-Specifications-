@@ -67,6 +67,7 @@ def create_deepgcn_layer(
     genconv_num_layers: int = 2,
     norm_type: str = 'layer',
     dropout: float = 0.0,
+    edge_dim: int = None,
 ) -> PyGnn.DeepGCNLayer:
     """
     Create a DeepGCNLayer with GENConv.
@@ -76,17 +77,20 @@ def create_deepgcn_layer(
         genconv_num_layers: Number of MLP layers in GENConv
         norm_type: 'layer' or 'batch' normalization
         dropout: Dropout probability
+        edge_dim: Edge feature dimension (None = no edge features)
 
     Returns:
         DeepGCNLayer with res+ block
     """
-    conv = PyGnn.GENConv(
-        hidden_dim, hidden_dim,
+    conv_kwargs = dict(
         aggr='softmax',
         t=1.0,
         learn_t=True,
         num_layers=genconv_num_layers,
     )
+    if edge_dim is not None:
+        conv_kwargs['edge_dim'] = edge_dim
+    conv = PyGnn.GENConv(hidden_dim, hidden_dim, **conv_kwargs)
 
     if norm_type == 'batch':
         norm = nn.BatchNorm1d(hidden_dim)

@@ -77,7 +77,9 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
                 kcl_detach_backbone=False, kcl_violation_threshold=0.0,
                 kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
-                kcl_huber_delta=0.0):
+                kcl_huber_delta=0.0,
+                device_consistency_weight=0.0,
+                intermediate_v_weight=0.0):
     """
     Train for one epoch.
 
@@ -255,7 +257,15 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 region_loss_weight=region_loss_weight,
                 region_pred=out_dict.get('mosfet_region_pred'),
                 node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
+                device_consistency_weight=device_consistency_weight,
+                batch=batch,
             )
+
+            # Intermediate voltage auxiliary loss
+            if intermediate_v_weight > 0 and 'intermediate_voltages' in out_dict:
+                int_v_pred = out_dict['intermediate_voltages'][mask]
+                int_v_loss = torch.nn.functional.mse_loss(int_v_pred, target)
+                loss = loss + intermediate_v_weight * int_v_loss
 
             # Track current loss and MAE
             if current_mask is not None and current_mask.any():
@@ -352,7 +362,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
              kcl_detach_backbone=False, kcl_violation_threshold=0.0,
              kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
-             kcl_huber_delta=0.0, amp_dtype=None):
+             kcl_huber_delta=0.0, amp_dtype=None,
+             device_consistency_weight=0.0):
     """
     Validate the model.
 
@@ -362,7 +373,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
 
     Returns:
         Tuple of (avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua,
-                  acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc5, current_acc2,
+                  acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5,
                   avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss,
                   avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss,
                   avg_triode_physics_loss, avg_triode_eq1/2/3_loss, avg_cutoff_physics_loss, avg_region_loss)
@@ -391,6 +402,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     total_current_count = 0
     all_errors = []
     all_current_errors = []
+    all_current_preds = []
+    all_current_targets = []
 
     for batch in loader:
         needs_transfer = str(batch.x.device).split(':')[0] != str(device).split(':')[0]
@@ -501,6 +514,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             region_loss_weight=region_loss_weight,
             region_pred=out_dict.get('mosfet_region_pred'),
             node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
+            device_consistency_weight=device_consistency_weight,
+            batch=batch,
         )
 
         # Track current loss and MAE
@@ -517,6 +532,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             total_current_mae += current_errors_ua.sum()
             total_current_count += current_batch_size
             all_current_errors.extend(current_errors_ua.cpu().tolist())
+            all_current_preds.extend(current_pred_orig.cpu().tolist())
+            all_current_targets.extend(current_target_orig.cpu().tolist())
 
         batch_size = len(target)
         total_loss += loss.float() * batch_size
@@ -565,11 +582,12 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
 
     # Accuracy metrics
     acc80, acc50, acc20, acc10 = compute_voltage_accuracy(all_errors)
-    if all_current_errors:
-        all_current_errors = np.array(all_current_errors)
-        current_acc50, current_acc20, current_acc5, current_acc2 = compute_current_accuracy(all_current_errors)
+    if all_current_preds:
+        current_acc50, current_acc20, current_acc10, current_acc5 = compute_current_accuracy(
+            np.array(all_current_preds), np.array(all_current_targets)
+        )
     else:
-        current_acc50, current_acc20, current_acc5, current_acc2 = 0.0, 0.0, 0.0, 0.0
+        current_acc50, current_acc20, current_acc10, current_acc5 = 0.0, 0.0, 0.0, 0.0
     avg_kcl_loss = (total_kcl_loss / total_count).item()
     avg_diff_pair_loss = (total_diff_pair_loss / total_count).item() if constraint_weight > 0 else 0.0
     avg_mirror_loss = (total_mirror_loss / total_count).item() if constraint_weight > 0 else 0.0
@@ -585,7 +603,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     avg_cutoff_physics_loss = (total_cutoff_physics_loss / total_count).item()
     avg_region_loss = (total_region_loss / total_count).item() if region_loss_weight > 0 else 0.0
 
-    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc5, current_acc2, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss
+    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss
 
 
 def validate_simple(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,

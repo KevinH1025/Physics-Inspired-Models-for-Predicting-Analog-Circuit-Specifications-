@@ -45,6 +45,10 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['skip_connection'] = model_cfg.get('skip_connection', True)
     args['gradient_checkpointing'] = model_cfg.get('gradient_checkpointing', False)
 
+    # Edge features
+    args['use_edge_features'] = model_cfg.get('edge_features', False)
+    args['input_dropout'] = model_cfg.get('input_dropout', 0.0)
+
     # Virtual node - support both nested and flat formats
     vn_cfg = model_cfg.get('virtual_node', {})
     args['virtual_node'] = vn_cfg.get('enabled', model_cfg.get('use_virtual_node', False))
@@ -86,6 +90,26 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'dropout': current_gnn_cfg.get('dropout', model_cfg.get('dropout', 0.0)),
         'genconv_num_layers': current_gnn_cfg.get('genconv_num_layers', model_cfg.get('genconv_num_layers', 2)),
         'head_layers': current_gnn_cfg.get('head_layers', 2),
+    }
+
+    # Device-level pooling current head
+    args['use_device_pooling_current'] = current_cfg.get('device_pooling', False)
+
+    # Device aggregation layer (device virtual node)
+    device_agg_cfg = model_cfg.get('device_aggregation', {})
+    args['device_aggregation_config'] = {
+        'enabled': device_agg_cfg.get('enabled', False),
+        'after_layer': device_agg_cfg.get('after_layer', None),
+        'after_layers': device_agg_cfg.get('after_layers', None),
+        'attention': device_agg_cfg.get('attention', False),
+        'separate_mlps': device_agg_cfg.get('separate_mlps', False),
+    }
+
+    # Intermediate voltage prediction + feedback
+    intermediate_v_cfg = model_cfg.get('intermediate_voltage', {})
+    args['intermediate_voltage_config'] = {
+        'enabled': intermediate_v_cfg.get('enabled', False),
+        'after_layer': intermediate_v_cfg.get('after_layer', None),
     }
 
     # Frozen Device MLP for MOSFET current prediction
@@ -151,6 +175,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     train_cfg_preview = config.get('training', {})
     args['loss_type'] = loss_cfg.get('type', loss_cfg.get('loss_type', 'mse'))
     args['huber_delta'] = loss_cfg.get('huber_delta', 1.0)
+    args['intermediate_v_weight'] = loss_cfg.get('intermediate_v_weight', 0.0)
     args['current_weight'] = loss_cfg.get('current_weight', train_cfg_preview.get('current_weight', 1.0))
     args['kcl_weight'] = loss_cfg.get('kcl_weight', train_cfg_preview.get('kcl_weight', 0.0))
     # Current loss warmup - ramp current_weight from 0 to target over N epochs
@@ -225,6 +250,9 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['ac_loss_start_epoch'] = ac_cfg.get('start_epoch', 0)
     args['ac_loss_warmup_epochs'] = ac_cfg.get('warmup_epochs', 0)
 
+    # Device consistency loss
+    args['device_consistency_weight'] = loss_cfg.get('device_consistency_weight', 0.0)
+
     # Region classification loss
     region_cfg = loss_cfg.get('region_loss', {})
     args['region_loss_weight'] = region_cfg.get('weight', 0.0)
@@ -259,6 +287,10 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['val_freq'] = train_cfg.get('val_freq', 1)
     args['early_stopping_patience'] = train_cfg.get('early_stopping_patience', 80)
     args['seed'] = train_cfg.get('seed', 42)
+
+    # Output
+    output_cfg = config.get('output', {})
+    args['name'] = output_cfg.get('name', None)
 
     # Normalization
     norm_cfg = config.get('normalization', {})

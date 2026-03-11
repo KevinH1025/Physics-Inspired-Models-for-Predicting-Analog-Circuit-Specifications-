@@ -297,8 +297,11 @@ class CircuitGraphBuilder:
                 ntype = ('VNode', 'NGND')
             nets.append(NetNode(name=net_name, net_type=net_type, ntype=ntype))
 
-        # Build edges (terminal <-> net)
+        # Build edges (terminal <-> net) with optional edge type features
         edges = []
+        edge_type_list = []
+        EDGE_TYPE_MAP = {'gate': 0, 'drain': 1, 'source': 2, 'bulk': 3, 'p': 4, 'n': 5}
+        num_edge_types = len(EDGE_TYPE_MAP)
         net_to_idx = {net.name: len(terminals) + i for i, net in enumerate(nets)}
 
         for term_idx, term in enumerate(terminals):
@@ -306,6 +309,11 @@ class CircuitGraphBuilder:
             if net_idx is not None:
                 edges.append([term_idx, net_idx])
                 edges.append([net_idx, term_idx])
+                # One-hot edge type for both directions
+                etype = [0.0] * num_edge_types
+                etype[EDGE_TYPE_MAP.get(term.terminal_type, 0)] = 1.0
+                edge_type_list.append(etype)
+                edge_type_list.append(etype)
 
         # Build feature tensors
         x_list = []
@@ -392,6 +400,7 @@ class CircuitGraphBuilder:
         # Build device info for physics-based current computation
         resistor_info = self._create_resistor_info(terminals, net_to_idx)
         capacitor_info = self._create_capacitor_info(terminals, net_to_idx)
+        vsource_info = self._create_vsource_info(terminals, net_to_idx)
         isource_info = self._create_isource_info(terminals, net_to_idx, i_ref)
 
         # Create physics constraint tensors (lazy import to avoid circular dependency)
@@ -401,10 +410,12 @@ class CircuitGraphBuilder:
         )
 
         # Create Data object
+        edge_attr = torch.tensor(edge_type_list, dtype=torch.float) if edge_type_list else torch.zeros((0, num_edge_types), dtype=torch.float)
         data = Data(
             x=x,
             type_tens=type_tens,
             edge_index=torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.zeros((2, 0), dtype=torch.long),
+            edge_attr=edge_attr,
             output_node_mask=output_node_mask,
             known_voltage_mask=known_voltage_mask,
             train_mask=train_mask,
@@ -418,6 +429,7 @@ class CircuitGraphBuilder:
             mosfet_region_labels=mosfet_region_labels,
             resistor_info=resistor_info,
             capacitor_info=capacitor_info,
+            vsource_info=vsource_info,
             isource_info=isource_info,
             diff_pair_constraints=diff_pair_constraints,
             mirror_constraints=mirror_constraints,
@@ -533,7 +545,7 @@ class CircuitGraphBuilder:
         terminal_current_sign = torch.zeros(num_nodes, dtype=torch.float)
         kcl_include_mask = torch.zeros(num_nodes, dtype=torch.bool)
 
-        excl_devices = excluded_current_devices or {'vcm_ref'}
+        excl_devices = excluded_current_devices or set()
 
         for i, term in enumerate(terminals):
             device_type = term.device_type
@@ -560,18 +572,19 @@ class CircuitGraphBuilder:
 
             # Target is always magnitude — supervised via MSE regardless of KCL
             current_targets[i] = abs_current
-            has_current_mask[i] = has_target and significant
-            # KCL inclusion (separate from MSE supervision):
-            # - MOSFETs: always (even if current is tiny)
-            # - Voltage sources: excluded from KCL (supply nets are redundant
-            #   global constraints that hurt optimization without helping)
-            # - Others (R, C, I): if significant current
-            if device_type == 'M':
+            # Capacitors: DC current is 0 but include for KCL completeness
+            if device_type == 'C':
+                has_current_mask[i] = True
                 kcl_include_mask[i] = True
-            elif device_type == 'V':
-                kcl_include_mask[i] = False
+                current_targets[i] = 0.0
             else:
-                kcl_include_mask[i] = significant
+                has_current_mask[i] = has_target and significant
+                # KCL inclusion: all devices with significant current
+                # (including V-sources for supply net KCL)
+                if device_type == 'M':
+                    kcl_include_mask[i] = True
+                else:
+                    kcl_include_mask[i] = significant
 
             # Sign convention for KCL:
             # - MOSFET: fixed by device type (NMOS drain=-1, source=+1, etc.)
@@ -759,6 +772,38 @@ class CircuitGraphBuilder:
 
         if capacitor_info:
             return torch.tensor(capacitor_info, dtype=torch.long)
+        return torch.zeros((0, 4), dtype=torch.long)
+
+    def _create_vsource_info(
+        self,
+        terminals: List[TerminalNode],
+        net_to_idx: Dict[str, int]
+    ) -> torch.Tensor:
+        """Create voltage source info tensor.
+
+        Returns tensor [num_vsources, 4]:
+            [term_p_idx, term_n_idx, net_p_idx, net_n_idx]
+        """
+        device_terminals = defaultdict(dict)
+        for i, term in enumerate(terminals):
+            if term.device_type == 'V':
+                device_terminals[term.device_name][term.terminal_type] = (i, term)
+
+        vsource_info = []
+        for dev_name, terms in device_terminals.items():
+            if 'p' in terms and 'n' in terms:
+                p_idx, p_term = terms['p']
+                n_idx, n_term = terms['n']
+                net_p_idx = net_to_idx.get(p_term.net, -1)
+                net_n_idx = net_to_idx.get(n_term.net, -1)
+
+                if -1 in [net_p_idx, net_n_idx]:
+                    continue
+
+                vsource_info.append([p_idx, n_idx, net_p_idx, net_n_idx])
+
+        if vsource_info:
+            return torch.tensor(vsource_info, dtype=torch.long)
         return torch.zeros((0, 4), dtype=torch.long)
 
     def _create_isource_info(

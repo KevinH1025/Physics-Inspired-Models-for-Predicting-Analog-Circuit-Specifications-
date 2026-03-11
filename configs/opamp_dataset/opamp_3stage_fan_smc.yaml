@@ -79,7 +79,7 @@ sampling:
   save_interval: 1000
 
   filter:
-    enabled: false
+    enabled: true
     rail_margin: 0.0
     exclude_nodes:
       - nbias     # PMOS bias reference (M0 diode gate)
@@ -138,8 +138,8 @@ parameters:
   C_COMP: { min: 0.5e-12, max: 30.0e-12, scale: log }
 
   # === OPERATING POINT ===
-  VCM:   { min: 0.7, max: 0.9, scale: linear }              # capped at 0.9V for PMOS folded-cascode headroom
-  VDIFF: { min: -0.05, max: 0.05, scale: linear }
+  VCM:   { min: 0.6, max: 0.9, scale: linear }
+  VDIFF: { value: 0 }
 
   # === FIXED PARAMETERS ===
   VDD:  { value: 1.8 }

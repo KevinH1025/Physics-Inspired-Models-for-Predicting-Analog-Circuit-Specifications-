@@ -82,16 +82,12 @@ sampling:
     enabled: true
     rail_margin: 0.0
     exclude_nodes:
-      - nbias
-      - vb3
-      - vb4
+      - gnda
+      - dm_2
+      - net063
       - net31
       - net54
       - net56
-      - dm_1
-      - dm_2
-      - net063
-      - voutn
     saturation_only: false
 
   # Constraints removed — with wide ranges, let SPICE reject non-convergent designs
@@ -138,7 +134,7 @@ parameters:
 
   # === OPERATING POINT ===
   VCM:   { min: 0.7, max: 0.9, scale: linear }
-  VDIFF: { min: -0.05, max: 0.05, scale: linear }
+  VDIFF: { value: 0 }
 
   # === FIXED PARAMETERS ===
   VDD:  { value: 1.8 }

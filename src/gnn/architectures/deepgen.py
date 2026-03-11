@@ -134,6 +134,17 @@ class DeepGENConv(BaseGNN):
         # Frozen Device MLP options
         use_frozen_device_mlp: bool = False,
         frozen_device_mlp_config: dict = None,
+        # Device-level pooling current head
+        use_device_pooling_current: bool = False,
+        # Edge features
+        use_edge_features: bool = False,
+        edge_feature_dim: int = 6,
+        # Input feature dropout
+        input_dropout: float = 0.0,
+        # Device aggregation layer (device virtual node)
+        device_aggregation_config: dict = None,
+        # Intermediate voltage prediction + feedback
+        intermediate_voltage_config: dict = None,
         # Refinement pass options (two-pass architecture)
         use_refinement_pass: bool = False,
         refinement_config: dict = None,
@@ -154,6 +165,7 @@ class DeepGENConv(BaseGNN):
         self.derive_currents_from_voltage = derive_currents_from_voltage
         self.use_gnn_current_prediction = use_gnn_current_prediction
         self.use_frozen_device_mlp = use_frozen_device_mlp
+        self.use_device_pooling_current = use_device_pooling_current
         self.use_refinement_pass = use_refinement_pass
         self.kcl_zspace_projection = kwargs.get('kcl_zspace_projection', False)
         self.kcl_blend_alpha = kwargs.get('kcl_blend_alpha', 0.0)
@@ -165,12 +177,44 @@ class DeepGENConv(BaseGNN):
         mosfet_current_mlp_config = mosfet_current_mlp_config or {}
         current_gnn_config = current_gnn_config or {}
 
+        # Device aggregation layer (device virtual node)
+        device_aggregation_config = device_aggregation_config or {}
+        if device_aggregation_config.get('enabled', False):
+            from src.gnn.components.device_aggregation import DeviceAggregationLayer
+            self.device_agg = DeviceAggregationLayer(
+                hidden_dim, norm_type=norm_type,
+                attention=device_aggregation_config.get('attention', False),
+                separate_mlps=device_aggregation_config.get('separate_mlps', False),
+            )
+            # Support both single layer and multiple layers
+            after_layers = device_aggregation_config.get('after_layers', None)
+            if after_layers is not None:
+                self.device_agg_after_layers = set(after_layers)
+            else:
+                single = device_aggregation_config.get('after_layer', num_layers // 2)
+                self.device_agg_after_layers = {single}
+        else:
+            self.device_agg = None
+            self.device_agg_after_layers = set()
+
+        # Intermediate voltage prediction + feedback
+        intermediate_voltage_config = intermediate_voltage_config or {}
+        if intermediate_voltage_config.get('enabled', False):
+            self.intermediate_v_head = nn.Linear(hidden_dim, 1)
+            self.intermediate_v_proj = nn.Linear(1, hidden_dim)
+            self.intermediate_v_after_layer = intermediate_voltage_config.get('after_layer', num_layers // 2)
+        else:
+            self.intermediate_v_head = None
+
         # Input projection
         self.input_linear = nn.Linear(node_feature_dim, hidden_dim)
 
         # Message passing layers
+        self.use_edge_features = use_edge_features
+        self.input_dropout = input_dropout
+        edge_dim = edge_feature_dim if use_edge_features else None
         self.layers = nn.ModuleList([
-            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout)
+            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
             for _ in range(num_layers)
         ])
 
@@ -250,6 +294,22 @@ class DeepGENConv(BaseGNN):
                 self.current_head = None
                 self.mosfet_current_mlp = None
                 self.current_gnn_backbone = None
+                self.device_current_head = None
+            elif use_device_pooling_current:
+                # Device-level pooling: predict one current per device from terminal embeddings
+                from src.gnn.components.device_current_head import DevicePoolingCurrentHead
+                c_hidden = current_head_config.get('hidden_dim', 256)
+                c_dropout = current_head_config.get('dropout', 0.0)
+                self.device_current_head = DevicePoolingCurrentHead(
+                    embed_dim=mlp_input_dim,
+                    hidden_dim=c_hidden,
+                    dropout=c_dropout,
+                    norm_type=norm_type,
+                )
+                self.current_head = None
+                self.mosfet_current_mlp = None
+                self.current_gnn_backbone = None
+                self.frozen_device_mlp = None
             else:
                 # Traditional independent current head
                 c_layers = current_head_config.get('num_layers', num_mlp_layers)
@@ -259,6 +319,7 @@ class DeepGENConv(BaseGNN):
                 self.mosfet_current_mlp = None
                 self.current_gnn_backbone = None
                 self.frozen_device_mlp = None
+                self.device_current_head = None
 
         # Refinement pass: uses V_pred₁ and I_pred₁ to predict ΔV
         # V_pred₂ = V_pred₁ + ΔV, then re-run current GNN for I_pred₂
@@ -415,6 +476,7 @@ class DeepGENConv(BaseGNN):
         edge_index: torch.Tensor,
         batch: Optional[torch.Tensor] = None,
         num_graphs: Optional[int] = None,
+        data=None,
     ) -> list:
         """Run message passing layers and collect outputs.
 
@@ -428,20 +490,49 @@ class DeepGENConv(BaseGNN):
         if self.virtual_node is not None:
             vn_emb = self.virtual_node.init_embedding(num_graphs)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             # Broadcast VN to nodes (if enabled)
             if self.virtual_node is not None:
                 x = x + self.virtual_node.broadcast(vn_emb, batch)
 
             # Message passing (with optional gradient checkpointing)
+            edge_attr = getattr(data, 'edge_attr', None) if self.use_edge_features and data is not None else None
             if self.gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, edge_index, use_reentrant=False)
+                if edge_attr is not None:
+                    x = checkpoint(layer, x, edge_index, edge_attr, use_reentrant=False)
+                else:
+                    x = checkpoint(layer, x, edge_index, use_reentrant=False)
             else:
-                x = layer(x, edge_index)
+                if edge_attr is not None:
+                    x = layer(x, edge_index, edge_attr)
+                else:
+                    x = layer(x, edge_index)
 
             # Update VN from nodes (if enabled)
             if self.virtual_node is not None:
                 vn_emb, _ = self.virtual_node(x, vn_emb, batch, num_graphs)
+
+            # Device aggregation: inject device context after specified layer
+            if self.device_agg is not None and i in self.device_agg_after_layers and data is not None:
+                x = self.device_agg(
+                    x,
+                    mosfet_info=getattr(data, 'mosfet_info', None),
+                    resistor_info=getattr(data, 'resistor_info', None),
+                    capacitor_info=getattr(data, 'capacitor_info', None),
+                    vsource_info=getattr(data, 'vsource_info', None),
+                    isource_info=getattr(data, 'isource_info', None),
+                    ptr=getattr(data, 'ptr', None),
+                    mosfet_ptr=getattr(data, 'mosfet_ptr', None),
+                    resistor_ptr=getattr(data, 'resistor_ptr', None),
+                    capacitor_ptr=getattr(data, 'capacitor_ptr', None),
+                    isource_ptr=getattr(data, 'isource_ptr', None),
+                )
+
+            # Intermediate voltage prediction + feedback
+            if self.intermediate_v_head is not None and i == self.intermediate_v_after_layer:
+                v_mid = self.intermediate_v_head(x).squeeze(-1)  # [num_nodes]
+                self._intermediate_v_pred = v_mid
+                x = x + self.intermediate_v_proj(v_mid.unsqueeze(-1))
 
             layer_outputs.append(x)
 
@@ -456,6 +547,41 @@ class DeepGENConv(BaseGNN):
             x = torch.cat([x, x_in], dim=-1)
 
         return x
+
+    def _enforce_per_device_current(self, node_currents: torch.Tensor, data) -> torch.Tensor:
+        """Enforce one current per device by averaging terminal predictions.
+
+        For MOSFETs: average drain and source predictions.
+        For 2-terminal devices (R, C, V, I): average p and n predictions.
+        """
+        out = node_currents.clone()
+
+        # MOSFETs: average drain + source
+        if hasattr(data, 'mosfet_info') and data.mosfet_info is not None and data.mosfet_info.numel() > 0:
+            drain_idx = data.mosfet_info[:, 1].long()
+            source_idx = data.mosfet_info[:, 2].long()
+            avg = (out[drain_idx] + out[source_idx]) / 2
+            out[drain_idx] = avg
+            out[source_idx] = avg
+
+        # 2-terminal devices: average p + n
+        for attr in ('resistor_info', 'capacitor_info', 'vsource_info'):
+            info = getattr(data, attr, None)
+            if info is not None and info.numel() > 0:
+                p_idx = info[:, 0].long()
+                n_idx = info[:, 1].long()
+                avg = (out[p_idx] + out[n_idx]) / 2
+                out[p_idx] = avg
+                out[n_idx] = avg
+
+        if hasattr(data, 'isource_info') and data.isource_info is not None and data.isource_info.numel() > 0:
+            p_idx = data.isource_info[:, 0].long()
+            n_idx = data.isource_info[:, 1].long()
+            avg = (out[p_idx] + out[n_idx]) / 2
+            out[p_idx] = avg
+            out[n_idx] = avg
+
+        return out
 
     def _apply_kcl_zspace_projection(self, currents: torch.Tensor, data) -> torch.Tensor:
         """
@@ -608,6 +734,8 @@ class DeepGENConv(BaseGNN):
             Dict with 'node_voltages' and optionally 'node_currents'
         """
         x_in = self._get_input_features(data)
+        if self.input_dropout > 0:
+            x_in = F.dropout(x_in, p=self.input_dropout, training=self.training)
         x = self.input_linear(x_in)
 
         # Get batch info for virtual node (if enabled)
@@ -619,11 +747,15 @@ class DeepGENConv(BaseGNN):
             )
             num_graphs = self._get_num_graphs(data, batch)
 
-        layer_outputs, vn_emb = self._message_passing(x, data.edge_index, batch, num_graphs)
+        layer_outputs, vn_emb = self._message_passing(x, data.edge_index, batch, num_graphs, data=data)
         x = self._get_final_representation(layer_outputs, x_in)
 
         result = {'node_voltages': self.voltage_head(x).squeeze(-1)}
         result['node_embeddings'] = x  # Pre-head embeddings for detached KCL
+
+        # Include intermediate voltage prediction for auxiliary loss
+        if self.intermediate_v_head is not None and hasattr(self, '_intermediate_v_pred'):
+            result['intermediate_voltages'] = self._intermediate_v_pred
 
         current_vn_emb = None  # Will be set by current GNN if VN is enabled
 
@@ -925,6 +1057,22 @@ class DeepGENConv(BaseGNN):
                 result['node_currents'] = combined_currents
                 result['voltage_derived_current_mask'] = voltage_derived_mask
 
+            elif self.use_device_pooling_current:
+                # Device-level pooling: one current per device
+                result['node_currents'] = self.device_current_head(
+                    x=x,
+                    mosfet_info=getattr(data, 'mosfet_info', None),
+                    resistor_info=getattr(data, 'resistor_info', None),
+                    capacitor_info=getattr(data, 'capacitor_info', None),
+                    vsource_info=getattr(data, 'vsource_info', None),
+                    isource_info=getattr(data, 'isource_info', None),
+                    num_nodes=x.size(0),
+                    ptr=getattr(data, 'ptr', None),
+                    mosfet_ptr=getattr(data, 'mosfet_ptr', None),
+                    resistor_ptr=getattr(data, 'resistor_ptr', None),
+                    capacitor_ptr=getattr(data, 'capacitor_ptr', None),
+                    isource_ptr=getattr(data, 'isource_ptr', None),
+                )
             else:
                 # Traditional independent current prediction
                 result['node_currents'] = self.current_head(x).squeeze(-1)

@@ -31,7 +31,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Import from modular data package
-from src.data.sampling import generate_lhs_samples, generate_random_params, worker_generate_sample
+from src.data.sampling import generate_lhs_samples, worker_generate_sample
 from src.data.batching import create_prebatched_dataset
 from src.data.plotting import (
     plot_parameter_distributions,

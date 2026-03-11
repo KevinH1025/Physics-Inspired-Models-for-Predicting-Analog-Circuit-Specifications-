@@ -189,6 +189,7 @@ class CircuitSimulator:
         specs = {}
         all_net_voltages = {}
         all_device_currents = {}
+        mosfet_terminal_currents = {}
         
         try:
             # Get operating point results
@@ -210,14 +211,30 @@ class CircuitSimulator:
                     
                     # Current vectors from .save commands:
                     # 1. @m.xm1.msky130_fd_pr__nfet_01v8[id] - MOSFET drain current
+                    #    Also [is], [ig], [ib] for source, gate, bulk currents
                     # 2. i(rin), i(rfb), i(rz) - resistor currents (NgSpice compatible)
                     # 3. @iref[i] - current source current
                     # 4. device#branch - voltage source currents
-                    if vector_lower.startswith('@m.') and '[id]' in vector_lower:
-                        parts = vector_name.split('.')
-                        if len(parts) >= 2:
-                            device_name = parts[1]
-                            is_current = True
+                    if vector_lower.startswith('@m.'):
+                        # Check for any MOSFET terminal current
+                        terminal_type = None
+                        for t in ('id', 'is', 'ig', 'ib'):
+                            if f'[{t}]' in vector_lower:
+                                terminal_type = t
+                                break
+                        if terminal_type is not None:
+                            parts = vector_name.split('.')
+                            if len(parts) >= 2:
+                                device_name = parts[1]
+                                # Store in mosfet_terminal_currents (all terminals)
+                                if device_name not in mosfet_terminal_currents:
+                                    mosfet_terminal_currents[device_name] = {}
+                                mosfet_terminal_currents[device_name][terminal_type] = value
+                                # Only drain current goes into all_device_currents (backward compat)
+                                if terminal_type == 'id':
+                                    is_current = True
+                                else:
+                                    continue  # skip non-drain terminals (don't pollute voltages)
                     elif vector_lower.startswith('i(') and vector_lower.endswith(')'):
                         # i(device) format for resistor currents
                         device_name = vector_name[2:-1]  # Extract device name from i(device)
@@ -232,6 +249,8 @@ class CircuitSimulator:
                     
                     if is_current:
                         all_device_currents[device_name] = value
+                    elif vector_lower.startswith('m.') or '#' in vector_lower:
+                        pass  # skip internal subcircuit body/drain/source voltages
                     else:
                         all_net_voltages[vector_name] = value
                 except (ValueError, IndexError, AttributeError):
@@ -245,6 +264,7 @@ class CircuitSimulator:
             specs['dc_supply_v'] = v_supply
             specs['_all_net_voltages'] = all_net_voltages  # CRITICAL: Used for GNN targets
             specs['_all_device_currents'] = all_device_currents
+            specs['_mosfet_terminal_currents'] = mosfet_terminal_currents
 
             # Extract MOSFET operating regions for saturation filtering
             mosfet_regions = self._extract_mosfet_regions(ngspice, available_vectors)
@@ -287,6 +307,7 @@ class CircuitSimulator:
             'dc_supply_v': 0.0,
             '_all_net_voltages': {},
             '_all_device_currents': {},
+            '_mosfet_terminal_currents': {},
             '_mosfet_regions': {}
         }
         

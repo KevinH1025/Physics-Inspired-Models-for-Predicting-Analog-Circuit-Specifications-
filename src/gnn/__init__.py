@@ -40,7 +40,6 @@ from .architectures import (
 from .components import (
     build_mlp,
     create_deepgcn_layer,
-    JumpingKnowledge,
     VirtualNode,
 )
 
@@ -58,6 +57,5 @@ __all__ = [
     # Components
     'build_mlp',
     'create_deepgcn_layer',
-    'JumpingKnowledge',
     'VirtualNode',
 ]

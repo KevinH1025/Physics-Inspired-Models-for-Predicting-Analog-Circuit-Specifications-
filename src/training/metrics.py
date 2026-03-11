@@ -29,22 +29,25 @@ def compute_voltage_accuracy(
 
 
 def compute_current_accuracy(
-    errors_ua: np.ndarray,
-    thresholds: List[float] = [50, 20, 5, 2]
+    pred_orig: np.ndarray,
+    target_orig: np.ndarray,
+    thresholds: List[float] = [50, 20, 10, 5]
 ) -> Tuple[float, ...]:
     """
-    Compute current accuracy at different thresholds.
+    Compute current accuracy at relative error thresholds.
 
     Args:
-        errors_ua: Array of absolute errors in µA
-        thresholds: List of threshold values in µA
+        pred_orig: Denormalized predicted currents (Amps)
+        target_orig: Denormalized target currents (Amps)
+        thresholds: Relative error thresholds in percent
 
     Returns:
         Tuple of accuracy percentages for each threshold
     """
-    if len(errors_ua) == 0:
+    if len(pred_orig) == 0:
         return tuple(0.0 for _ in thresholds)
-    return tuple((errors_ua < t).mean() * 100 for t in thresholds)
+    rel_errors_pct = np.abs(pred_orig - target_orig) / np.maximum(np.abs(target_orig), 1e-15) * 100
+    return tuple((rel_errors_pct < t).mean() * 100 for t in thresholds)
 
 
 def denormalize_voltage(

@@ -205,7 +205,7 @@ def apply_kcl_conservation_projection(
     valid_src = src[valid_edges]
     valid_dst = dst[valid_edges]
 
-    # Filter by kcl_include_mask (exclude V-source, gate, bulk terminals)
+    # Filter by kcl_include_mask (exclude gate, bulk terminals with 0 DC current)
     if kcl_include_mask is not None:
         kcl_eligible = kcl_include_mask[valid_src]
         valid_src = valid_src[kcl_eligible]
@@ -291,7 +291,7 @@ def compute_kcl_loss(
     KCL: Sum of signed currents at each internal net node = 0
 
     Only applies KCL to nets where ground truth satisfies KCL (truly internal nets).
-    Nets connected to voltage sources are filtered out since their currents are not predictable.
+    Nets where KCL is unsatisfiable (single terminal, all same sign) are filtered out.
 
     Args:
         node_currents: Predicted currents for all nodes in batch (normalized magnitudes)
@@ -304,7 +304,7 @@ def compute_kcl_loss(
         current_std: Std for denormalization (log10 scale)
         gt_currents: Ground truth currents (normalized) for filtering valid KCL nets
         kcl_threshold: Threshold for GT sum to consider net valid for KCL (in Amps)
-        kcl_include_mask: Mask for terminals to include in KCL (False for V-sources)
+        kcl_include_mask: Mask for terminals to include in KCL (False for gate/bulk)
         kcl_min_current: Minimum total current for a net to be included in KCL (filters noise)
 
     Returns:
@@ -330,7 +330,8 @@ def compute_kcl_loss(
     else:
         terminal_mask = local_idx < num_terminals[batch_idx]
 
-    # Internal net mask: train_mask AND not terminal
+    # Net node mask: only nets where we predict voltages (internal + output)
+    # Excludes supply (vdda/gnda) and input nets — matches apply_kcl_conservation_projection
     internal_net_mask = train_mask & ~terminal_mask
 
     # Valid edges: terminal -> internal net
@@ -345,7 +346,7 @@ def compute_kcl_loss(
     valid_src = src[valid_edges]
     valid_dst = dst[valid_edges]
 
-    # Filter to KCL-eligible terminals for predictions (exclude V-sources)
+    # Filter to KCL-eligible terminals (exclude gate/bulk with 0 DC current)
     # This must happen BEFORE computing sums, so predicted sums and GT sums
     # are computed consistently over the same set of terminals
     if kcl_include_mask is not None:
@@ -364,7 +365,6 @@ def compute_kcl_loss(
     has_enough_terms = terms_per_net >= 2
 
     # Filter out nets where all terminals have the same sign (KCL unsatisfiable)
-    # e.g. vdd/vss (all current flows one direction) or vg2 (two n-terminals)
     if terminal_current_sign is not None:
         sign_at_src = terminal_current_sign[valid_src]
         pos_per_net = torch.zeros(num_nodes, device=device, dtype=torch.long)
@@ -649,9 +649,7 @@ def compute_kcl_per_net_debug(
         global_idx = start + local_idx
         net_name = names[local_idx] if local_idx < len(names) else f"net_{local_idx}"
 
-        # Skip if not in train_mask (boundary node)
-        if not train_mask[global_idx]:
-            continue
+        # (No train_mask filter — include all nets for KCL debug)
 
         # Find terminals connected to this net
         src, dst = edge_index
@@ -1229,6 +1227,62 @@ def compute_region_loss(
     return F.mse_loss(pred, target)
 
 
+def _batch_offsets(num_devices, device_ptr, ptr, device):
+    """Compute per-device node offsets for batched graphs."""
+    if device_ptr is not None:
+        graph_idx = torch.bucketize(
+            torch.arange(num_devices, device=device),
+            device_ptr[1:].to(device), right=True)
+    else:
+        num_graphs = len(ptr) - 1
+        devices_per_graph = num_devices // num_graphs
+        graph_idx = torch.arange(num_devices, device=device) // devices_per_graph
+    return ptr[graph_idx]
+
+
+def compute_device_consistency_loss(
+    node_currents: torch.Tensor,
+    batch,
+) -> torch.Tensor:
+    """MSE between terminal predictions of the same device.
+
+    Penalizes drain != source for MOSFETs, p != n for 2-terminal devices.
+    Operates in normalized z-score space (same as model output).
+    """
+    total = torch.tensor(0.0, device=node_currents.device)
+    count = 0
+    ptr = getattr(batch, 'ptr', None)
+    is_batched = ptr is not None and len(ptr) > 2
+
+    # MOSFETs: drain vs source
+    if hasattr(batch, 'mosfet_info') and batch.mosfet_info is not None and batch.mosfet_info.numel() > 0:
+        d = batch.mosfet_info[:, 1].long()
+        s = batch.mosfet_info[:, 2].long()
+        if is_batched:
+            offsets = _batch_offsets(len(d), getattr(batch, 'mosfet_ptr', None), ptr, d.device)
+            d = d + offsets
+            s = s + offsets
+        total = total + (node_currents[d] - node_currents[s]).pow(2).sum()
+        count += d.shape[0]
+
+    # 2-terminal devices: p vs n
+    for attr, ptr_attr in [('resistor_info', 'resistor_ptr'), ('capacitor_info', 'capacitor_ptr'),
+                           ('vsource_info', None), ('isource_info', 'isource_ptr')]:
+        info = getattr(batch, attr, None)
+        if info is not None and info.numel() > 0:
+            p_idx = info[:, 0].long()
+            n_idx = info[:, 1].long()
+            if is_batched:
+                dev_ptr = getattr(batch, ptr_attr, None) if ptr_attr else None
+                offsets = _batch_offsets(len(p_idx), dev_ptr, ptr, p_idx.device)
+                p_idx = p_idx + offsets
+                n_idx = n_idx + offsets
+            total = total + (node_currents[p_idx] - node_currents[n_idx]).pow(2).sum()
+            count += p_idx.shape[0]
+
+    return total / max(count, 1)
+
+
 # Combined Loss
 def compute_combined_loss(
     voltage_pred: torch.Tensor,
@@ -1323,6 +1377,9 @@ def compute_combined_loss(
     region_loss_weight: float = 0.0,
     region_pred: torch.Tensor = None,
     node_region_labels: torch.Tensor = None,
+    # Device consistency loss
+    device_consistency_weight: float = 0.0,
+    batch=None,
 ) -> tuple:
     """
     Compute combined loss from all components.
@@ -1347,7 +1404,7 @@ def compute_combined_loss(
         terminal_current_sign: Sign for each terminal (+1 drain, -1 source) (for KCL)
         current_mean: Mean for current denormalization (log10 scale, for KCL)
         current_std: Std for current denormalization (log10 scale, for KCL)
-        kcl_include_mask: Mask for terminals to include in KCL (False for V-sources)
+        kcl_include_mask: Mask for terminals to include in KCL (False for gate/bulk)
         kcl_min_current: Minimum total current for a net to be included in KCL
         constraint_weight: Weight for physics constraint losses (0 to disable)
         mosfet_info: MOSFET info tensor [num_mosfets, 7] (for constraints)
@@ -1509,7 +1566,7 @@ def compute_combined_loss(
     triode_eq1_loss = torch.tensor(0.0, device=voltage_loss.device)
     triode_eq2_loss = torch.tensor(0.0, device=voltage_loss.device)
     triode_eq3_loss = torch.tensor(0.0, device=voltage_loss.device)
-    if ss_gm_pred is not None and ss_gds_pred is not None and full_voltage_pred is not None:
+    if triode_physics_loss_weight > 0 and ss_gm_pred is not None and ss_gds_pred is not None and full_voltage_pred is not None:
         tri_cfg = triode_physics_config or {}
         triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss = compute_triode_physics_loss(
             ss_gm_pred=ss_gm_pred,
@@ -1543,7 +1600,7 @@ def compute_combined_loss(
 
     # Cutoff/subthreshold physics loss
     cutoff_physics_loss = torch.tensor(0.0, device=voltage_loss.device)
-    if ss_gm_pred is not None and current_pred is not None:
+    if cutoff_physics_loss_weight > 0 and ss_gm_pred is not None and current_pred is not None:
         cutoff_physics_loss = compute_cutoff_physics_loss(
             ss_gm_pred=ss_gm_pred,
             pred_currents=current_pred,
@@ -1568,6 +1625,12 @@ def compute_combined_loss(
             node_region_labels=node_region_labels,
         )
 
+    # Device consistency loss
+    if device_consistency_weight > 0 and current_pred is not None and batch is not None:
+        dev_consistency_loss = compute_device_consistency_loss(current_pred, batch)
+    else:
+        dev_consistency_loss = torch.tensor(0.0, device=voltage_pred.device)
+
     total_loss = (voltage_loss +
                   current_weight * current_loss +
                   kcl_weight * kcl_loss +
@@ -1577,6 +1640,7 @@ def compute_combined_loss(
                   ss_loss_weight * ss_loss +
                   triode_physics_loss_weight * triode_physics_loss +
                   cutoff_physics_loss_weight * cutoff_physics_loss +
-                  region_loss_weight * region_loss)
+                  region_loss_weight * region_loss +
+                  device_consistency_weight * dev_consistency_loss)
 
     return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss
