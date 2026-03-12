@@ -177,6 +177,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['huber_delta'] = loss_cfg.get('huber_delta', 1.0)
     args['intermediate_v_weight'] = loss_cfg.get('intermediate_v_weight', 0.0)
     args['current_weight'] = loss_cfg.get('current_weight', train_cfg_preview.get('current_weight', 1.0))
+    args['voltage_weight'] = loss_cfg.get('voltage_weight', 1.0)
     args['kcl_weight'] = loss_cfg.get('kcl_weight', train_cfg_preview.get('kcl_weight', 0.0))
     # Current loss warmup - ramp current_weight from 0 to target over N epochs
     args['current_warmup_epochs'] = loss_cfg.get('current_warmup_epochs', train_cfg_preview.get('current_warmup_epochs', 0))
@@ -191,6 +192,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['kcl_detach_backbone'] = loss_cfg.get('kcl_detach_backbone', False)  # stop KCL gradient to backbone
     args['kcl_violation_threshold'] = loss_cfg.get('kcl_violation_threshold', 0.0)  # min relative violation to penalize
     args['kcl_huber_delta'] = loss_cfg.get('kcl_huber_delta', 0.0)  # 0 = disabled (use MSE), >0 = Huber delta for 3-term KCL
+    args['kcl_gt_filter'] = loss_cfg.get('kcl_gt_filter', 0.1)  # max GT relative violation for multi-term nets (0 = disabled)
     args['kcl_conservation'] = loss_cfg.get('kcl_conservation', False)  # structural KCL enforcement via projection
     args['kcl_skip_two_term'] = loss_cfg.get('kcl_skip_two_term', False)  # skip 2-term KCL loss (when enforced in architecture)
     args['kcl_only_two_term'] = loss_cfg.get('kcl_only_two_term', False)  # only compute 2-term KCL loss, skip 3+ term nets

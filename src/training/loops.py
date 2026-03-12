@@ -59,7 +59,7 @@ def build_voltage_node_weights(
 
 
 def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
-                predict_currents=False, current_weight=1.0, kcl_weight=0.0,
+                predict_currents=False, current_weight=1.0, voltage_weight=1.0, kcl_weight=0.0,
                 current_mean=0.0, current_std=1.0,
                 loss_type='mse', huber_delta=1.0, kcl_min_current=1e-9,
                 constraint_weight=0.0, amp_dtype=None,
@@ -77,7 +77,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
                 kcl_detach_backbone=False, kcl_violation_threshold=0.0,
                 kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
-                kcl_huber_delta=0.0,
+                kcl_huber_delta=0.0, kcl_gt_filter=0.1,
                 device_consistency_weight=0.0,
                 intermediate_v_weight=0.0):
     """
@@ -187,6 +187,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 current_target=batch.node_current_targets if predict_currents else None,
                 current_mask=current_mask,
                 current_weight=current_weight,
+                voltage_weight=voltage_weight,
                 loss_type=loss_type,
                 huber_delta=huber_delta,
                 kcl_weight=kcl_weight,
@@ -202,6 +203,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 kcl_mode=kcl_mode,
                 kcl_violation_threshold=kcl_violation_threshold,
                 kcl_huber_delta=kcl_huber_delta,
+                kcl_gt_filter=kcl_gt_filter,
                 kcl_exclusive=kcl_exclusive,
                 kcl_detach_backbone=kcl_detach_backbone,
                 kcl_skip_two_term=kcl_skip_two_term,
@@ -346,7 +348,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
 
 @torch.inference_mode()
 def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,
-             predict_currents=False, current_weight=1.0, kcl_weight=0.0,
+             predict_currents=False, current_weight=1.0, voltage_weight=1.0, kcl_weight=0.0,
              loss_type='mse', huber_delta=1.0, kcl_min_current=1e-9,
              constraint_weight=0.0, lambda_n=0.05,
              stage2_nodes=None, stage2_weight=1.0,
@@ -362,7 +364,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
              kcl_detach_backbone=False, kcl_violation_threshold=0.0,
              kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
-             kcl_huber_delta=0.0, amp_dtype=None,
+             kcl_huber_delta=0.0, kcl_gt_filter=0.1, amp_dtype=None,
              device_consistency_weight=0.0):
     """
     Validate the model.
@@ -444,6 +446,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             current_target=batch.node_current_targets if predict_currents else None,
             current_mask=current_mask,
             current_weight=current_weight,
+            voltage_weight=voltage_weight,
             loss_type=loss_type,
             huber_delta=huber_delta,
             kcl_weight=kcl_weight,
@@ -459,6 +462,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             kcl_mode=kcl_mode,
             kcl_violation_threshold=kcl_violation_threshold,
             kcl_huber_delta=kcl_huber_delta,
+            kcl_gt_filter=kcl_gt_filter,
             kcl_exclusive=kcl_exclusive,
             kcl_detach_backbone=kcl_detach_backbone,
             kcl_skip_two_term=kcl_skip_two_term,

@@ -680,6 +680,7 @@ def main():
     kcl_detach_backbone = getattr(args, 'kcl_detach_backbone', False)
     kcl_violation_threshold = getattr(args, 'kcl_violation_threshold', 0.0)
     kcl_huber_delta = getattr(args, 'kcl_huber_delta', 0.0)
+    kcl_gt_filter = getattr(args, 'kcl_gt_filter', 0.1)
     kcl_conservation = getattr(args, 'kcl_conservation', False)
     kcl_skip_two_term = getattr(args, 'kcl_skip_two_term', False)
     kcl_only_two_term = getattr(args, 'kcl_only_two_term', False)
@@ -901,7 +902,9 @@ def main():
 
         loss, mae_norm, voltage_loss, current_loss, current_mae_ua, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, cutoff_physics_loss, region_loss = train_epoch(
             model, train_loader, optimizer, args.gradient_clip, args.device, scaler,
-            predict_currents=predict_currents, current_weight=current_weight, kcl_weight=kcl_weight,
+            predict_currents=predict_currents, current_weight=current_weight,
+            voltage_weight=getattr(args, 'voltage_weight', 1.0),
+            kcl_weight=kcl_weight,
             current_mean=current_mean, current_std=current_std, loss_type=loss_type, huber_delta=huber_delta,
             kcl_min_current=kcl_min_current, constraint_weight=constraint_weight, amp_dtype=amp_dtype,
             vdc_mean=vdc_mean, vdc_std=vdc_std,
@@ -921,6 +924,7 @@ def main():
             kcl_detach_backbone=kcl_detach_backbone,
             kcl_violation_threshold=kcl_violation_threshold,
             kcl_huber_delta=kcl_huber_delta,
+            kcl_gt_filter=kcl_gt_filter,
             kcl_conservation=kcl_conservation,
             kcl_skip_two_term=kcl_skip_two_term,
             kcl_only_two_term=kcl_only_two_term,
@@ -947,7 +951,9 @@ def main():
         if val_loader and epoch % val_freq == 0:
             val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss = validate(
                 model, val_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
-                predict_currents=predict_currents, current_weight=current_weight, kcl_weight=kcl_weight,
+                predict_currents=predict_currents, current_weight=current_weight,
+                voltage_weight=getattr(args, 'voltage_weight', 1.0),
+                kcl_weight=kcl_weight,
                 loss_type=loss_type, huber_delta=huber_delta, kcl_min_current=kcl_min_current,
                 constraint_weight=constraint_weight,
                 stage2_nodes=stage2_nodes, stage2_weight=stage2_weight,
@@ -966,6 +972,7 @@ def main():
                 kcl_detach_backbone=kcl_detach_backbone,
                 kcl_violation_threshold=kcl_violation_threshold,
                 kcl_huber_delta=kcl_huber_delta,
+                kcl_gt_filter=kcl_gt_filter,
                 kcl_conservation=kcl_conservation,
                 kcl_skip_two_term=kcl_skip_two_term,
                 kcl_only_two_term=kcl_only_two_term,
@@ -1025,7 +1032,9 @@ def main():
             if epoch > 0 and epoch % 50 == 0:
                 tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss = validate(
                     model, train_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
-                    predict_currents=predict_currents, current_weight=current_weight, kcl_weight=kcl_weight,
+                    predict_currents=predict_currents, current_weight=current_weight,
+                    voltage_weight=getattr(args, 'voltage_weight', 1.0),
+                    kcl_weight=kcl_weight,
                     loss_type=loss_type, huber_delta=huber_delta, constraint_weight=constraint_weight,
                     stage2_nodes=stage2_nodes, stage2_weight=stage2_weight,
                     use_terminal_voltage_loss=use_terminal_voltage_loss,

@@ -283,6 +283,7 @@ def compute_kcl_loss(
     kcl_skip_two_term: bool = False,  # skip 2-term KCL loss (useful when 2-term is enforced in architecture)
     kcl_only_two_term: bool = False,  # only compute 2-term KCL loss, skip 3+ term nets
     kcl_huber_delta: float = 0.0,  # 0 = disabled (use MSE), >0 = Huber delta for 3-term logsumexp
+    kcl_gt_filter: float = 0.1,  # max GT relative violation for multi-term nets (0 = disabled)
 ):
     """
     Compute Kirchhoff's Current Law loss on internal net nodes for batched graphs.
@@ -478,11 +479,11 @@ def compute_kcl_loss(
         unique_nets, net_indices = torch.unique(multi_dst, return_inverse=True)
         n_multi_nets = unique_nets.size(0)
 
-        # GT filter (shared across modes): exclude nets where GT violates KCL > 10%
+        # GT filter: exclude nets where GT violates KCL beyond threshold
         valid_multi = torch.ones(n_multi_nets, device=device, dtype=torch.bool)
         n_multi_before_filter = n_multi_nets
-        if gt_currents is not None:
-            gt_z_at_src = gt_currents.squeeze()[valid_src]
+        gt_z_at_src = gt_currents.squeeze()[valid_src] if gt_currents is not None else None
+        if gt_currents is not None and kcl_gt_filter > 0:
             gt_multi_z = gt_z_at_src[multi_edges]
             gt_raw = torch.pow(10, gt_multi_z * current_std + current_mean)
             gt_signed = gt_raw * multi_sign
@@ -491,7 +492,7 @@ def compute_kcl_loss(
             gt_abs_sums = torch.zeros(n_multi_nets, device=device)
             gt_abs_sums.scatter_add_(0, net_indices, gt_raw)
             gt_rel_viol = gt_sums.abs() / (gt_abs_sums + 1e-12)
-            valid_multi = valid_multi & (gt_rel_viol < 0.1)
+            valid_multi = valid_multi & (gt_rel_viol < kcl_gt_filter)
 
         if stats is not None:
             stats['n_multi_total'] = n_multi_before_filter
@@ -647,9 +648,9 @@ def compute_kcl_per_net_debug(
     # For each internal net
     for local_idx in range(n_terms, end - start):
         global_idx = start + local_idx
+        if not train_mask[global_idx]:
+            continue
         net_name = names[local_idx] if local_idx < len(names) else f"net_{local_idx}"
-
-        # (No train_mask filter — include all nets for KCL debug)
 
         # Find terminals connected to this net
         src, dst = edge_index
@@ -1292,6 +1293,7 @@ def compute_combined_loss(
     current_target: torch.Tensor = None,
     current_mask: torch.Tensor = None,
     current_weight: float = 1.0,
+    voltage_weight: float = 1.0,
     loss_type: str = 'mse',
     huber_delta: float = 1.0,
     kcl_weight: float = 0.0,
@@ -1307,6 +1309,7 @@ def compute_combined_loss(
     kcl_mode: str = 'logsumexp',
     kcl_violation_threshold: float = 0.0,
     kcl_huber_delta: float = 0.0,
+    kcl_gt_filter: float = 0.1,
     kcl_exclusive: bool = False,
     kcl_conservation: bool = False,
     kcl_detach_backbone: bool = False,
@@ -1462,6 +1465,7 @@ def compute_combined_loss(
             kcl_skip_two_term=kcl_skip_two_term,
             kcl_only_two_term=kcl_only_two_term,
             kcl_huber_delta=kcl_huber_delta,
+            kcl_gt_filter=kcl_gt_filter,
         )
 
     # When kcl_exclusive=True, exclude KCL-supervised terminals from current MSE
@@ -1631,7 +1635,7 @@ def compute_combined_loss(
     else:
         dev_consistency_loss = torch.tensor(0.0, device=voltage_pred.device)
 
-    total_loss = (voltage_loss +
+    total_loss = (voltage_weight * voltage_loss +
                   current_weight * current_loss +
                   kcl_weight * kcl_loss +
                   constraint_weight * constraint_loss +
