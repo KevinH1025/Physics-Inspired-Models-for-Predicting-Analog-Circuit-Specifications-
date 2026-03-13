@@ -1357,7 +1357,8 @@ def compute_combined_loss(
     ac_std: torch.Tensor = None,
     ac_components: list = None,
     # Supervised gm/gds prediction loss parameters (mask-based)
-    ss_loss_weight: float = 0.0,
+    ss_gm_loss_weight: float = 0.0,
+    ss_gds_loss_weight: float = 0.0,
     ss_gm_pred: torch.Tensor = None,
     ss_gds_pred: torch.Tensor = None,
     mosfet_drain_mask: torch.Tensor = None,
@@ -1554,8 +1555,9 @@ def compute_combined_loss(
         )
 
     # Supervised gm/gds prediction loss (mask-based)
-    ss_loss = torch.tensor(0.0, device=voltage_loss.device)
-    if ss_loss_weight > 0 and ss_gm_pred is not None and ss_gds_pred is not None and mosfet_drain_mask is not None:
+    ss_gm_loss = torch.tensor(0.0, device=voltage_loss.device)
+    ss_gds_loss = torch.tensor(0.0, device=voltage_loss.device)
+    if (ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0) and ss_gm_pred is not None and ss_gds_pred is not None and mosfet_drain_mask is not None:
         ss_gm_loss, ss_gds_loss = compute_ss_loss(
             gm_pred=ss_gm_pred,
             gds_pred=ss_gds_pred,
@@ -1563,7 +1565,6 @@ def compute_combined_loss(
             node_log_gm=node_log_gm,
             node_log_gds=node_log_gds,
         )
-        ss_loss = ss_gm_loss + ss_gds_loss
 
     # Triode physics regularizer loss
     triode_physics_loss = torch.tensor(0.0, device=voltage_loss.device)
@@ -1641,10 +1642,11 @@ def compute_combined_loss(
                   constraint_weight * constraint_loss +
                   gm_physics_loss_weight * gm_physics_loss +
                   ac_loss_weight * ac_loss +
-                  ss_loss_weight * ss_loss +
+                  ss_gm_loss_weight * ss_gm_loss +
+                  ss_gds_loss_weight * ss_gds_loss +
                   triode_physics_loss_weight * triode_physics_loss +
                   cutoff_physics_loss_weight * cutoff_physics_loss +
                   region_loss_weight * region_loss +
                   device_consistency_weight * dev_consistency_loss)
 
-    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss
+    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss

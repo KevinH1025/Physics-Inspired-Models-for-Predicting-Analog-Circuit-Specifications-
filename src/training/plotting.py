@@ -26,8 +26,10 @@ def plot_training_curves(
     val_current_losses: List[float] = None,
     train_current_maes: List[float] = None,
     val_current_maes: List[float] = None,
-    train_ss_losses: List[float] = None,
-    val_ss_losses: List[float] = None,
+    train_ss_gm_losses: List[float] = None,
+    val_ss_gm_losses: List[float] = None,
+    train_ss_gds_losses: List[float] = None,
+    val_ss_gds_losses: List[float] = None,
     train_kcl_losses: List[float] = None,
     val_kcl_losses: List[float] = None,
     train_ac_losses: List[float] = None,
@@ -47,8 +49,9 @@ def plot_training_curves(
     num_epochs = len(train_losses)
 
     # Determine grid size based on what losses are active
+    has_region = train_region_losses and any(v > 0 for v in train_region_losses)
     has_kcl_ac = (train_ac_losses and any(v > 0 for v in train_ac_losses)) or \
-                 (train_kcl_losses and any(v > 0 for v in train_kcl_losses))
+                 (train_kcl_losses and any(v > 0 for v in train_kcl_losses)) or has_region
     has_physics = (train_gm_physics_losses and any(v > 0 for v in train_gm_physics_losses)) or \
                   (train_triode_physics_losses and any(v > 0 for v in train_triode_physics_losses)) or \
                   (train_cutoff_physics_losses and any(v > 0 for v in train_cutoff_physics_losses))
@@ -125,37 +128,38 @@ def plot_training_curves(
         axes[1, 0].axis('off')
         axes[1, 1].axis('off')
 
-    if train_ss_losses and any(v > 0 for v in train_ss_losses):
+    if train_ss_gm_losses and any(v > 0 for v in train_ss_gm_losses):
         ax = axes[1, 2]
-        ax.semilogy(train_epochs, train_ss_losses, 'b-', label='Train', alpha=0.7)
-        if val_ss_losses:
-            ax.semilogy(val_epochs, val_ss_losses, 'r-', label='Val', alpha=0.7)
+        ax.semilogy(train_epochs, train_ss_gm_losses, 'b-', label='Train', alpha=0.7)
+        if val_ss_gm_losses:
+            ax.semilogy(val_epochs, val_ss_gm_losses, 'r-', label='Val', alpha=0.7)
         ax.set_xlabel('Epoch')
-        ax.set_ylabel('SS Loss (MSE)')
-        ax.set_title('SS Loss (gm + gds)')
+        ax.set_ylabel('gm Loss (MSE)')
+        ax.set_title('SS gm Loss')
         ax.legend()
         ax.grid(True, alpha=0.3)
     else:
         axes[1, 2].axis('off')
 
-    if train_region_losses and any(v > 0 for v in train_region_losses):
+    if train_ss_gds_losses and any(v > 0 for v in train_ss_gds_losses):
         ax = axes[1, 3]
-        ax.plot(train_epochs, train_region_losses, 'b-', label='Train', alpha=0.7)
-        if val_region_losses:
-            ax.plot(val_epochs, val_region_losses, 'r-', label='Val', alpha=0.7)
+        ax.semilogy(train_epochs, train_ss_gds_losses, 'b-', label='Train', alpha=0.7)
+        if val_ss_gds_losses:
+            ax.semilogy(val_epochs, val_ss_gds_losses, 'r-', label='Val', alpha=0.7)
         ax.set_xlabel('Epoch')
-        ax.set_ylabel('Region Loss (ordinal MSE)')
-        ax.set_title('Region Classification Loss')
+        ax.set_ylabel('gds Loss (MSE)')
+        ax.set_title('SS gds Loss')
         ax.legend()
         ax.grid(True, alpha=0.3)
     else:
         axes[1, 3].axis('off')
 
-    # Row 3: KCL Loss, AC Loss (if present)
+    # Row 3: KCL Loss, AC Loss, Region Loss (if present)
     if has_kcl_ac:
         kcl_ac_row = 2
+        col = 0
         if train_kcl_losses and any(v > 0 for v in train_kcl_losses):
-            ax = axes[kcl_ac_row, 0]
+            ax = axes[kcl_ac_row, col]
             ax.semilogy(train_epochs, train_kcl_losses, 'b-', label='Train', alpha=0.7)
             if val_kcl_losses:
                 ax.semilogy(val_epochs, val_kcl_losses, 'r-', label='Val', alpha=0.7)
@@ -164,11 +168,10 @@ def plot_training_curves(
             ax.set_title('KCL Loss')
             ax.legend()
             ax.grid(True, alpha=0.3)
-        else:
-            axes[kcl_ac_row, 0].axis('off')
+            col += 1
 
         if train_ac_losses and any(v > 0 for v in train_ac_losses):
-            ax = axes[kcl_ac_row, 1]
+            ax = axes[kcl_ac_row, col]
             ax.semilogy(train_epochs, train_ac_losses, 'b-', label='Train', alpha=0.7)
             if val_ac_losses:
                 ax.semilogy(val_epochs, val_ac_losses, 'r-', label='Val', alpha=0.7)
@@ -177,11 +180,22 @@ def plot_training_curves(
             ax.set_title('AC Loss')
             ax.legend()
             ax.grid(True, alpha=0.3)
-        else:
-            axes[kcl_ac_row, 1].axis('off')
+            col += 1
 
-        axes[kcl_ac_row, 2].axis('off')
-        axes[kcl_ac_row, 3].axis('off')
+        if has_region:
+            ax = axes[kcl_ac_row, col]
+            ax.plot(train_epochs, train_region_losses, 'b-', label='Train', alpha=0.7)
+            if val_region_losses:
+                ax.plot(val_epochs, val_region_losses, 'r-', label='Val', alpha=0.7)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Region Loss (ordinal MSE)')
+            ax.set_title('Region Classification Loss')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            col += 1
+
+        for c in range(col, 4):
+            axes[kcl_ac_row, c].axis('off')
 
     # Physics losses row: gm_sat, triode, cutoff
     if has_physics:

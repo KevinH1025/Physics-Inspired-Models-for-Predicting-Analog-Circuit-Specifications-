@@ -270,9 +270,10 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['region_loss_weight'] = region_cfg.get('weight', 0.0)
     args['region_loss_start_epoch'] = region_cfg.get('start_epoch', 0)
 
-    # Supervised gm/gds prediction loss
+    # Supervised gm/gds prediction loss (separate weights)
     ss_cfg = loss_cfg.get('ss_loss', {})
-    args['ss_loss_weight'] = ss_cfg.get('weight', 0.0)
+    args['ss_gm_loss_weight'] = ss_cfg.get('gm_weight', ss_cfg.get('weight', 0.0))
+    args['ss_gds_loss_weight'] = ss_cfg.get('gds_weight', ss_cfg.get('weight', 0.0))
     args['ss_loss_start_epoch'] = ss_cfg.get('start_epoch', 0)
     args['ss_loss_warmup_epochs'] = ss_cfg.get('warmup_epochs', 0)
 

@@ -71,7 +71,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 ss_gm_mean=0.0, ss_gm_std=1.0,
                 ss_gds_mean=0.0, ss_gds_std=1.0,
                 ac_loss_weight=0.0, ac_mean=None, ac_std=None, ac_components=None,
-                ss_loss_weight=0.0,
+                ss_gm_loss_weight=0.0, ss_gds_loss_weight=0.0,
                 triode_physics_loss_weight=0.0, triode_physics_config=None,
                 cutoff_physics_loss_weight=0.0, cutoff_physics_n_nmos=1.5, cutoff_physics_n_pmos=2.0,
                 region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
@@ -109,12 +109,13 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
         ac_mean: [N] mean for enabled AC components
         ac_std: [N] std for enabled AC components
         ac_components: List of enabled AC component names (e.g. ['ugbw', 'pm', 'am'])
-        ss_loss_weight: Weight for supervised gm/gds loss (0 to disable)
+        ss_gm_loss_weight: Weight for supervised gm loss (0 to disable)
+        ss_gds_loss_weight: Weight for supervised gds loss (0 to disable)
 
     Returns:
         Tuple of (avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua,
                   avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss,
-                  avg_lambda_mirror_loss, avg_gm_loss, avg_ac_loss, avg_ss_loss)
+                  avg_lambda_mirror_loss, avg_gm_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss)
     """
     model.train()
     total_loss = 0
@@ -131,7 +132,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     total_lambda_mirror_loss = 0
     total_gm_physics_loss = 0
     total_ac_loss = 0
-    total_ss_loss = 0
+    total_ss_gm_loss = 0
+    total_ss_gds_loss = 0
     total_triode_physics_loss = 0
     total_triode_eq1_loss = 0
     total_triode_eq2_loss = 0
@@ -179,7 +181,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 batch, stage2_nodes, stage2_weight, device=device
             ) if not use_terminal_voltage_loss else None
 
-            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss = compute_combined_loss(
+            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss = compute_combined_loss(
                 voltage_pred=pred,
                 voltage_target=target,
                 current_pred=out_currents,
@@ -242,7 +244,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 ac_mean=ac_mean,
                 ac_std=ac_std,
                 ac_components=ac_components or out_dict.get('ac_components'),
-                ss_loss_weight=ss_loss_weight,
+                ss_gm_loss_weight=ss_gm_loss_weight,
+                ss_gds_loss_weight=ss_gds_loss_weight,
                 ss_gm_pred=out_dict.get('mosfet_gm_pred'),
                 ss_gds_pred=out_dict.get('mosfet_gds_pred'),
                 mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
@@ -313,8 +316,10 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
         total_gm_physics_loss += gm_physics_loss.detach().float() * batch_size
         if ac_loss_weight > 0:
             total_ac_loss += ac_loss.detach().float() * batch_size
-        if ss_loss_weight > 0:
-            total_ss_loss += ss_loss.detach().float() * batch_size
+        if ss_gm_loss_weight > 0:
+            total_ss_gm_loss += ss_gm_loss.detach().float() * batch_size
+        if ss_gds_loss_weight > 0:
+            total_ss_gds_loss += ss_gds_loss.detach().float() * batch_size
         total_triode_physics_loss += triode_physics_loss.detach().float() * batch_size
         total_triode_eq1_loss += triode_eq1_loss.detach().float() * batch_size
         total_triode_eq2_loss += triode_eq2_loss.detach().float() * batch_size
@@ -335,7 +340,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     avg_lambda_mirror_loss = (total_lambda_mirror_loss / total_count).item() if constraint_weight > 0 else 0.0
     avg_gm_physics_loss = (total_gm_physics_loss / total_count).item()
     avg_ac_loss = (total_ac_loss / total_count).item() if ac_loss_weight > 0 else 0.0
-    avg_ss_loss = (total_ss_loss / total_count).item() if ss_loss_weight > 0 else 0.0
+    avg_ss_gm_loss = (total_ss_gm_loss / total_count).item() if ss_gm_loss_weight > 0 else 0.0
+    avg_ss_gds_loss = (total_ss_gds_loss / total_count).item() if ss_gds_loss_weight > 0 else 0.0
     avg_triode_physics_loss = (total_triode_physics_loss / total_count).item()
     avg_triode_eq1_loss = (total_triode_eq1_loss / total_count).item()
     avg_triode_eq2_loss = (total_triode_eq2_loss / total_count).item()
@@ -343,7 +349,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     avg_cutoff_physics_loss = (total_cutoff_physics_loss / total_count).item()
     avg_region_loss = (total_region_loss / total_count).item() if region_loss_weight > 0 else 0.0
 
-    return avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss
+    return avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss
 
 
 @torch.inference_mode()
@@ -358,7 +364,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              ss_gm_mean=0.0, ss_gm_std=1.0,
              ss_gds_mean=0.0, ss_gds_std=1.0,
              ac_loss_weight=0.0, ac_mean=None, ac_std=None, ac_components=None,
-             ss_loss_weight=0.0,
+             ss_gm_loss_weight=0.0, ss_gds_loss_weight=0.0,
              triode_physics_loss_weight=0.0, triode_physics_config=None,
              cutoff_physics_loss_weight=0.0, cutoff_physics_n_nmos=1.5, cutoff_physics_n_pmos=2.0,
              region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
@@ -377,7 +383,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         Tuple of (avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua,
                   acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5,
                   avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss,
-                  avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss,
+                  avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss,
                   avg_triode_physics_loss, avg_triode_eq1/2/3_loss, avg_cutoff_physics_loss, avg_region_loss)
     """
     model.eval()
@@ -391,7 +397,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     total_lambda_mirror_loss = 0
     total_gm_physics_loss = 0
     total_ac_loss = 0
-    total_ss_loss = 0
+    total_ss_gm_loss = 0
+    total_ss_gds_loss = 0
     total_triode_physics_loss = 0
     total_triode_eq1_loss = 0
     total_triode_eq2_loss = 0
@@ -444,7 +451,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             batch, stage2_nodes, stage2_weight, device=device
         ) if not use_terminal_voltage_loss else None
 
-        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss = compute_combined_loss(
+        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss = compute_combined_loss(
             voltage_pred=pred,
             voltage_target=target,
             current_pred=out_currents,
@@ -507,7 +514,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             ac_mean=ac_mean,
             ac_std=ac_std,
             ac_components=ac_components or out_dict.get('ac_components'),
-            ss_loss_weight=ss_loss_weight,
+            ss_gm_loss_weight=ss_gm_loss_weight,
+            ss_gds_loss_weight=ss_gds_loss_weight,
             ss_gm_pred=out_dict.get('mosfet_gm_pred'),
             ss_gds_pred=out_dict.get('mosfet_gds_pred'),
             mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
@@ -564,8 +572,9 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         total_gm_physics_loss += gm_physics_loss.float() * batch_size
         if ac_loss_weight > 0:
             total_ac_loss += ac_loss.float() * batch_size
-        if ss_loss_weight > 0:
-            total_ss_loss += ss_loss.float() * batch_size
+        if ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0:
+            total_ss_gm_loss += ss_gm_loss.float() * batch_size
+            total_ss_gds_loss += ss_gds_loss.float() * batch_size
             # Collect SS relative errors for accuracy metrics
             gm_pred = out_dict.get('mosfet_gm_pred')
             gds_pred = out_dict.get('mosfet_gds_pred')
@@ -629,7 +638,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     avg_lambda_mirror_loss = (total_lambda_mirror_loss / total_count).item() if constraint_weight > 0 else 0.0
     avg_gm_physics_loss = (total_gm_physics_loss / total_count).item()
     avg_ac_loss = (total_ac_loss / total_count).item() if ac_loss_weight > 0 else 0.0
-    avg_ss_loss = (total_ss_loss / total_count).item() if ss_loss_weight > 0 else 0.0
+    avg_ss_gm_loss = (total_ss_gm_loss / total_count).item() if ss_gm_loss_weight > 0 else 0.0
+    avg_ss_gds_loss = (total_ss_gds_loss / total_count).item() if ss_gds_loss_weight > 0 else 0.0
     avg_triode_physics_loss = (total_triode_physics_loss / total_count).item()
     avg_triode_eq1_loss = (total_triode_eq1_loss / total_count).item()
     avg_triode_eq2_loss = (total_triode_eq2_loss / total_count).item()
@@ -671,7 +681,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         'ss_metrics': ss_metrics,
     }
 
-    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics
+    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics
 
 
 def validate_simple(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,

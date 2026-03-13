@@ -90,8 +90,10 @@ def main():
                         help='LR scale factor for backbone params when not frozen (default: 0.1 = 10x lower)')
     parser.add_argument('--preload-to-gpu', action='store_true',
                         help='Pre-load all batches to GPU (faster training, uses more VRAM)')
-    parser.add_argument('--ss-loss-weight', type=float, default=0.0, dest='ss_loss_weight',
-                        help='Weight for supervised gm/gds loss (0 = disabled)')
+    parser.add_argument('--ss-gm-loss-weight', type=float, default=0.0, dest='ss_gm_loss_weight',
+                        help='Weight for supervised gm loss (0 = disabled)')
+    parser.add_argument('--ss-gds-loss-weight', type=float, default=0.0, dest='ss_gds_loss_weight',
+                        help='Weight for supervised gds loss (0 = disabled)')
     parser.add_argument('--ac-loss-weight', type=float, default=0.0, dest='ac_loss_weight',
                         help='Weight for AC loss (UGBW, PM, AM) (0 = disabled)')
     parser.add_argument('--kcl-weight', type=float, default=0.0,
@@ -653,7 +655,8 @@ def main():
     train_losses, val_losses, val_maes = [], [], []
     train_voltage_losses, val_voltage_losses = [], []
     train_current_losses, val_current_losses = [], []
-    train_ss_losses, val_ss_losses = [], []
+    train_ss_gm_losses, val_ss_gm_losses = [], []
+    train_ss_gds_losses, val_ss_gds_losses = [], []
     train_kcl_losses, val_kcl_losses = [], []
     train_ac_losses, val_ac_losses = [], []
     train_region_losses, val_region_losses = [], []
@@ -703,7 +706,8 @@ def main():
     ac_loss_start_epoch_cfg = getattr(args, 'ac_loss_start_epoch', 0)
 
     # Supervised gm/gds loss config
-    ss_loss_weight_target = getattr(args, 'ss_loss_weight', 0.0)
+    ss_gm_loss_weight_target = getattr(args, 'ss_gm_loss_weight', 0.0)
+    ss_gds_loss_weight_target = getattr(args, 'ss_gds_loss_weight', 0.0)
     ss_loss_warmup_epochs = getattr(args, 'ss_loss_warmup_epochs', 0)
     ss_loss_start_epoch_cfg = getattr(args, 'ss_loss_start_epoch', 0)
 
@@ -863,13 +867,18 @@ def main():
         if ss_loss_warmup_epochs > 0 and epoch >= ss_loss_start_epoch:
             ss_epoch = epoch - ss_loss_start_epoch
             if ss_epoch < ss_loss_warmup_epochs:
-                ss_loss_weight = ss_loss_weight_target * (ss_epoch + 1) / ss_loss_warmup_epochs
+                ss_warmup_frac = (ss_epoch + 1) / ss_loss_warmup_epochs
+                ss_gm_loss_weight = ss_gm_loss_weight_target * ss_warmup_frac
+                ss_gds_loss_weight = ss_gds_loss_weight_target * ss_warmup_frac
             else:
-                ss_loss_weight = ss_loss_weight_target
+                ss_gm_loss_weight = ss_gm_loss_weight_target
+                ss_gds_loss_weight = ss_gds_loss_weight_target
         elif epoch < ss_loss_start_epoch:
-            ss_loss_weight = 0.0
+            ss_gm_loss_weight = 0.0
+            ss_gds_loss_weight = 0.0
         else:
-            ss_loss_weight = ss_loss_weight_target
+            ss_gm_loss_weight = ss_gm_loss_weight_target
+            ss_gds_loss_weight = ss_gds_loss_weight_target
 
         # Apply triode physics loss warmup
         tri_phy_start = triode_physics_loss_start_epoch_cfg if triode_physics_loss_start_epoch_cfg > 0 else current_warmup_epochs
@@ -900,7 +909,7 @@ def main():
         # Region loss: apply start_epoch
         region_loss_weight = region_loss_weight_target if epoch >= region_loss_start_epoch_cfg else 0.0
 
-        loss, mae_norm, voltage_loss, current_loss, current_mae_ua, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, cutoff_physics_loss, region_loss = train_epoch(
+        loss, mae_norm, voltage_loss, current_loss, current_mae_ua, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, cutoff_physics_loss, region_loss = train_epoch(
             model, train_loader, optimizer, args.gradient_clip, args.device, scaler,
             predict_currents=predict_currents, current_weight=current_weight,
             voltage_weight=getattr(args, 'voltage_weight', 1.0),
@@ -915,7 +924,7 @@ def main():
             ss_gm_mean=ss_gm_mean if has_ss else 0.0, ss_gm_std=ss_gm_std if has_ss else 1.0,
             ss_gds_mean=ss_gds_mean if has_ss else 0.0, ss_gds_std=ss_gds_std if has_ss else 1.0,
             ac_loss_weight=ac_loss_weight, ac_mean=ac_mean, ac_std=ac_std, ac_components=ac_components,
-            ss_loss_weight=ss_loss_weight,
+            ss_gm_loss_weight=ss_gm_loss_weight, ss_gds_loss_weight=ss_gds_loss_weight,
             triode_physics_loss_weight=triode_physics_loss_weight, triode_physics_config=triode_physics_config,
             cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
             region_loss_weight=region_loss_weight,
@@ -936,7 +945,8 @@ def main():
         train_losses.append(loss)
         train_voltage_losses.append(voltage_loss)
         train_current_losses.append(current_loss)
-        train_ss_losses.append(ss_loss)
+        train_ss_gm_losses.append(ss_gm_loss)
+        train_ss_gds_losses.append(ss_gds_loss)
         train_kcl_losses.append(kcl_loss)
         train_ac_losses.append(ac_loss)
         train_region_losses.append(region_loss)
@@ -949,7 +959,7 @@ def main():
 
         # Validation
         if val_loader and epoch % val_freq == 0:
-            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss, val_rel_metrics = validate(
+            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_gm_loss, val_ss_gds_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss, val_rel_metrics = validate(
                 model, val_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                 predict_currents=predict_currents, current_weight=current_weight,
                 voltage_weight=getattr(args, 'voltage_weight', 1.0),
@@ -963,7 +973,7 @@ def main():
                 ss_gm_mean=ss_gm_mean if has_ss else 0.0, ss_gm_std=ss_gm_std if has_ss else 1.0,
                 ss_gds_mean=ss_gds_mean if has_ss else 0.0, ss_gds_std=ss_gds_std if has_ss else 1.0,
                 ac_loss_weight=ac_loss_weight, ac_mean=ac_mean, ac_std=ac_std, ac_components=ac_components,
-                ss_loss_weight=ss_loss_weight,
+                ss_gm_loss_weight=ss_gm_loss_weight, ss_gds_loss_weight=ss_gds_loss_weight,
                 triode_physics_loss_weight=triode_physics_loss_weight, triode_physics_config=triode_physics_config,
                 cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
                 region_loss_weight=region_loss_weight,
@@ -984,7 +994,8 @@ def main():
             val_maes.append(val_mae_mv)
             val_voltage_losses.append(val_v_loss)
             val_current_losses.append(val_c_loss)
-            val_ss_losses.append(val_ss_loss)
+            val_ss_gm_losses.append(val_ss_gm_loss)
+            val_ss_gds_losses.append(val_ss_gds_loss)
             val_kcl_losses.append(val_kcl_loss)
             val_ac_losses.append(val_ac_loss)
             val_region_losses.append(val_region_loss)
@@ -1021,8 +1032,10 @@ def main():
                 postfix['gm_phy'] = f'{gm_physics_loss:.2e}'
             if ac_loss_weight > 0:
                 postfix['ac'] = f'{ac_loss:.2e}'
-            if ss_loss_weight > 0:
-                postfix['ss'] = f'{ss_loss:.2e}'
+            if ss_gm_loss_weight > 0:
+                postfix['gm'] = f'{ss_gm_loss:.2e}'
+            if ss_gds_loss_weight > 0:
+                postfix['gds'] = f'{ss_gds_loss:.2e}'
             if triode_physics_loss_weight > 0:
                 postfix['tri_phy'] = f'{triode_physics_loss:.2e}'
             if cutoff_physics_loss_weight > 0:
@@ -1031,7 +1044,7 @@ def main():
 
             # Detailed progress every 50 epochs
             if epoch > 0 and epoch % 50 == 0:
-                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss, _tr_rel_metrics = validate(
+                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_gm_loss, tr_ss_gds_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss, _tr_rel_metrics = validate(
                     model, train_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                     predict_currents=predict_currents, current_weight=current_weight,
                     voltage_weight=getattr(args, 'voltage_weight', 1.0),
@@ -1043,7 +1056,7 @@ def main():
                     ss_gm_mean=ss_gm_mean if has_ss else 0.0, ss_gm_std=ss_gm_std if has_ss else 1.0,
                     ss_gds_mean=ss_gds_mean if has_ss else 0.0, ss_gds_std=ss_gds_std if has_ss else 1.0,
                     ac_loss_weight=ac_loss_weight, ac_mean=ac_mean, ac_std=ac_std, ac_components=ac_components,
-                    ss_loss_weight=ss_loss_weight,
+                    ss_gm_loss_weight=ss_gm_loss_weight, ss_gds_loss_weight=ss_gds_loss_weight,
                     triode_physics_loss_weight=triode_physics_loss_weight, triode_physics_config=triode_physics_config,
                     cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
                     region_loss_weight=region_loss_weight,
@@ -1105,8 +1118,9 @@ def main():
                             rows.append(("  KCL/net", "", _pred_str))
                     except Exception as _e:
                         rows.append(("  detail", f"err: {_e}", ""))
-                if ss_loss_weight > 0:
-                    rows.append(("SS", f"{tr_ss_loss:.2e}", f"{val_ss_loss:.2e}"))
+                if ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0:
+                    rows.append(("SS/gm", f"{tr_ss_gm_loss:.2e}", f"{val_ss_gm_loss:.2e}"))
+                    rows.append(("SS/gds", f"{tr_ss_gds_loss:.2e}", f"{val_ss_gds_loss:.2e}"))
                     # SS accuracy on train and val
                     def _eval_ss(loader):
                         _gm_e, _gds_e, _gm_rel, _gds_rel = [], [], [], []
@@ -1418,7 +1432,8 @@ def main():
         output_path / 'training_curve.png', val_freq=val_freq, predict_currents=predict_currents,
         train_current_losses=train_current_losses, val_current_losses=val_current_losses,
         train_current_maes=train_current_maes, val_current_maes=val_current_maes,
-        train_ss_losses=train_ss_losses, val_ss_losses=val_ss_losses,
+        train_ss_gm_losses=train_ss_gm_losses, val_ss_gm_losses=val_ss_gm_losses,
+        train_ss_gds_losses=train_ss_gds_losses, val_ss_gds_losses=val_ss_gds_losses,
         train_kcl_losses=train_kcl_losses, val_kcl_losses=val_kcl_losses,
         train_ac_losses=train_ac_losses, val_ac_losses=val_ac_losses,
         train_region_losses=train_region_losses, val_region_losses=val_region_losses,
