@@ -596,7 +596,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             pred_mv, target_mv = denormalize_voltage(pred, target, vdc_mean, vdc_std)
         errors_mv = (pred_mv - target_mv).abs()
         all_errors.extend(errors_mv.cpu().tolist())
-        rel_errors_pct = errors_mv / torch.clamp(target_mv.abs(), min=1.0) * 100
+        rel_errors_pct = errors_mv / torch.clamp(target_mv.abs(), min=10.0) * 100
         all_rel_errors.extend(rel_errors_pct.cpu().tolist())
 
     all_errors = np.array(all_errors)

@@ -37,6 +37,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Model
     model_cfg = config.get('model', {})
+    args['model_type'] = model_cfg.get('type', 'deepgen')
     args['hidden'] = model_cfg.get('hidden_dim', 128)
     args['layers'] = model_cfg.get('num_layers', 15)
     args['dropout'] = model_cfg.get('dropout', 0.0)
@@ -169,6 +170,15 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # Z-space KCL projection (architectural enforcement for 2-term nets)
     args['kcl_zspace_projection'] = model_cfg.get('kcl_zspace_projection', False)
     args['kcl_blend_alpha'] = model_cfg.get('kcl_blend_alpha', 0.0)
+
+    # Tower architecture config (for tower_genconv)
+    tower_cfg = model_cfg.get('tower', {})
+    args['backbone_layers'] = tower_cfg.get('backbone_layers', 6)
+    args['state_tower_layers'] = tower_cfg.get('state_tower_layers', 2)
+    args['sensitivity_tower_layers'] = tower_cfg.get('sensitivity_tower_layers', 2)
+    args['backbone_jk_config'] = tower_cfg.get('backbone_jk', {})
+    args['state_tower_jk_config'] = tower_cfg.get('state_tower_jk', {})
+    args['sensitivity_tower_jk_config'] = tower_cfg.get('sensitivity_tower_jk', {})
 
     # Loss - support both nested and flat formats
     loss_cfg = config.get('loss', {})

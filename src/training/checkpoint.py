@@ -50,6 +50,13 @@ def create_model(
     region_head_config=None,
     kcl_zspace_projection=False,
     kcl_blend_alpha=0.0,
+    # Tower architecture options
+    backbone_layers=6,
+    state_tower_layers=2,
+    sensitivity_tower_layers=2,
+    backbone_jk_config=None,
+    state_tower_jk_config=None,
+    sensitivity_tower_jk_config=None,
 ):
     """
     Create a GNN model with the specified configuration.
@@ -144,6 +151,13 @@ def create_model(
         # Z-space KCL projection
         kcl_zspace_projection=kcl_zspace_projection,
         kcl_blend_alpha=kcl_blend_alpha,
+        # Tower architecture options
+        backbone_layers=backbone_layers,
+        state_tower_layers=state_tower_layers,
+        sensitivity_tower_layers=sensitivity_tower_layers,
+        backbone_jk_config=backbone_jk_config or {},
+        state_tower_jk_config=state_tower_jk_config or {},
+        sensitivity_tower_jk_config=sensitivity_tower_jk_config or {},
     )
 
     # Create model using registry
@@ -209,6 +223,12 @@ def create_model_from_args(args, input_dim, device='cuda'):
         region_head_config=getattr(args, 'region_head_config', {}),
         kcl_zspace_projection=getattr(args, 'kcl_zspace_projection', False),
         kcl_blend_alpha=getattr(args, 'kcl_blend_alpha', 0.0),
+        backbone_layers=getattr(args, 'backbone_layers', 6),
+        state_tower_layers=getattr(args, 'state_tower_layers', 2),
+        sensitivity_tower_layers=getattr(args, 'sensitivity_tower_layers', 2),
+        backbone_jk_config=getattr(args, 'backbone_jk_config', {}),
+        state_tower_jk_config=getattr(args, 'state_tower_jk_config', {}),
+        sensitivity_tower_jk_config=getattr(args, 'sensitivity_tower_jk_config', {}),
     )
 
 
@@ -359,7 +379,7 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         vn_learn_temperature=config.get('vn_learn_temperature', False),
         gradient_checkpointing=False,  # Not needed for inference
         device='cpu',  # Load to CPU first, then transfer after loading weights
-        model_type='deepgen',  # Always use 'deepgen', VN is a config option
+        model_type=model_type,  # Use detected model_type from config
         derive_currents_from_voltage=config.get('derive_currents_from_voltage', False),
         mosfet_current_mlp_config=config.get('mosfet_current_mlp_config', {}),
         use_gnn_current_prediction=config.get('use_gnn_current_prediction', False),
@@ -373,6 +393,12 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         region_head_config=config.get('region_head_config', {}),
         device_aggregation_config=config.get('device_aggregation_config',
             {'enabled': True} if any('device_agg.' in k for k in state_dict.keys()) else {}),
+        backbone_layers=config.get('backbone_layers', 6),
+        state_tower_layers=config.get('state_tower_layers', 2),
+        sensitivity_tower_layers=config.get('sensitivity_tower_layers', 2),
+        backbone_jk_config=config.get('backbone_jk_config', {}),
+        state_tower_jk_config=config.get('state_tower_jk_config', {}),
+        sensitivity_tower_jk_config=config.get('sensitivity_tower_jk_config', {}),
     )
 
     # Load weights and move to device
@@ -425,7 +451,6 @@ def build_full_config(args, total_input_dim, predict_currents, voltage_head_conf
     Returns:
         Dict with all config values
     """
-    # Model type - always 'deepgen', VN is a config option
     model_type = getattr(args, 'model_type', 'deepgen')
 
     return {
@@ -468,6 +493,13 @@ def build_full_config(args, total_input_dim, predict_currents, voltage_head_conf
         'ss_head_config': getattr(args, 'ss_head_config', {}),
         # Region classification head config
         'region_head_config': getattr(args, 'region_head_config', {}),
+        # Tower architecture config
+        'backbone_layers': getattr(args, 'backbone_layers', 6),
+        'state_tower_layers': getattr(args, 'state_tower_layers', 2),
+        'sensitivity_tower_layers': getattr(args, 'sensitivity_tower_layers', 2),
+        'backbone_jk_config': getattr(args, 'backbone_jk_config', {}),
+        'state_tower_jk_config': getattr(args, 'state_tower_jk_config', {}),
+        'sensitivity_tower_jk_config': getattr(args, 'sensitivity_tower_jk_config', {}),
         # Training params
         'learning_rate': args.lr,
         'weight_decay': getattr(args, 'weight_decay', 0.0),

@@ -34,6 +34,7 @@ from .registry import (
 from .architectures import (
     BaseGNN,
     DeepGENConv,
+    TowerGENConv,
 )
 
 # Import components for direct access
@@ -54,6 +55,7 @@ __all__ = [
     'BaseGNN',
     # Models
     'DeepGENConv',
+    'TowerGENConv',
     # Components
     'build_mlp',
     'create_deepgcn_layer',
