@@ -227,7 +227,17 @@ class TowerGENConv(BaseGNN):
 
         # --- Sensitivity Tower (gm/gds) ---
         self.has_sensitivity_tower = ss_head_config.get('enabled', False)
+        self.state_conditioned_sens = ss_head_config.get('state_conditioned', False)
+        self.detach_state_for_sens = ss_head_config.get('detach_state', True)
         if self.has_sensitivity_tower:
+            # Optional: fuse state tower embeddings into sensitivity tower input
+            if self.state_conditioned_sens:
+                self.state_sens_proj = nn.Sequential(
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                )
+
             self.sensitivity_tower = nn.ModuleList([
                 create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
                 for _ in range(sensitivity_tower_layers)
@@ -268,6 +278,8 @@ class TowerGENConv(BaseGNN):
             'use_virtual_node': use_virtual_node,
             'predict_currents': predict_currents,
             'has_sensitivity_tower': self.has_sensitivity_tower,
+            'state_conditioned_sens': self.state_conditioned_sens,
+            'detach_state_for_sens': self.detach_state_for_sens,
         }
 
     def _run_layers(
@@ -374,9 +386,13 @@ class TowerGENConv(BaseGNN):
         state_outputs, _ = self._run_layers(
             self.state_tower, backbone_hidden, data.edge_index, edge_attr,
         )
-        state_repr = self._finalize_repr(
-            self.state_jk, state_outputs, self.state_tower[0], x_in,
-        )
+
+        # Get state hidden (before skip) for sensitivity conditioning
+        state_hidden = self.state_jk(state_outputs)
+        state_hidden = self.state_tower[0].act(self.state_tower[0].norm(state_hidden))
+
+        # State repr with skip connection for prediction heads
+        state_repr = torch.cat([state_hidden, x_in], dim=-1) if self.skip_connection else state_hidden
 
         # State predictions
         result = {}
@@ -388,8 +404,15 @@ class TowerGENConv(BaseGNN):
 
         # --- Sensitivity Tower ---
         if self.has_sensitivity_tower:
+            # Optionally condition on state tower embeddings
+            if self.state_conditioned_sens:
+                state_for_sens = state_hidden.detach() if self.detach_state_for_sens else state_hidden
+                sens_input = self.state_sens_proj(torch.cat([backbone_hidden, state_for_sens], dim=-1))
+            else:
+                sens_input = backbone_hidden
+
             sens_outputs, _ = self._run_layers(
-                self.sensitivity_tower, backbone_hidden, data.edge_index, edge_attr,
+                self.sensitivity_tower, sens_input, data.edge_index, edge_attr,
             )
             sens_repr = self._finalize_repr(
                 self.sensitivity_jk, sens_outputs, self.sensitivity_tower[0], x_in,

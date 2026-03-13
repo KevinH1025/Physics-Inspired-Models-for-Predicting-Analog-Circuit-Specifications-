@@ -145,6 +145,8 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'hidden_dim': ss_head_cfg.get('hidden_dim', model_cfg.get('hidden_dim', 128)),
         'num_layers': ss_head_cfg.get('num_layers', 2),
         'dropout': ss_head_cfg.get('dropout', 0.0),
+        'state_conditioned': ss_head_cfg.get('state_conditioned', False),
+        'detach_state': ss_head_cfg.get('detach_state', True),
     }
 
     # Region classification head
