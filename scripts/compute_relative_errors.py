@@ -59,15 +59,17 @@ def compute_relative_errors(experiment_dir, dataset_dir, device='cuda'):
     if predict_currents:
         normalize_batches_current(val_batches, current_mean, current_std)
 
-    # SS normalization: compute from training data if model has SS head
+    # SS normalization: compute from all training variants if model has SS head
     has_ss = hasattr(val_batches[0], 'node_log_gm') and val_batches[0].node_log_gm is not None
     ss_enabled = config.get('ss_head_config', {}).get('enabled', False)
     ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std = 0.0, 1.0, 0.0, 1.0
     if has_ss and ss_enabled:
-        train_batches = load_prebatched_variant(dataset_dir / 'train', variant_id=0)
-        ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std = compute_ss_normalization([train_batches])
+        num_variants = config.get('num_variants', 10)
+        all_train = [load_prebatched_variant(dataset_dir / 'train', variant_id=i)
+                     for i in range(num_variants)]
+        ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std = compute_ss_normalization(all_train)
         normalize_batches_ss(val_batches, ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std)
-        del train_batches
+        del all_train
 
     all_v_rel = []
     all_v_abs_mv = []
@@ -75,6 +77,8 @@ def compute_relative_errors(experiment_dir, dataset_dir, device='cuda'):
     all_i_abs_ua = []
     all_gm_rel = []
     all_gds_rel = []
+    all_gm_log_errors = []
+    all_gds_log_errors = []
 
     with torch.inference_mode():
         for i, batch in enumerate(val_batches):
@@ -133,6 +137,8 @@ def compute_relative_errors(experiment_dir, dataset_dir, device='cuda'):
                 gds_rel = ((torch.pow(10, gds_pred_log) - torch.pow(10, gds_tgt_log)).abs() / torch.pow(10, gds_tgt_log).clamp(min=1e-15) * 100)
                 all_gm_rel.extend(gm_rel.cpu().tolist())
                 all_gds_rel.extend(gds_rel.cpu().tolist())
+                all_gm_log_errors.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
+                all_gds_log_errors.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
 
     all_v_abs_mv = np.array(all_v_abs_mv)
     all_v_rel = np.array(all_v_rel)
@@ -156,11 +162,17 @@ def compute_relative_errors(experiment_dir, dataset_dir, device='cuda'):
     if all_gm_rel:
         gm_rel_arr = np.array(all_gm_rel)
         gds_rel_arr = np.array(all_gds_rel)
+        gm_log_arr = np.array(all_gm_log_errors)
+        gds_log_arr = np.array(all_gds_log_errors)
         results['ss_metrics'] = {
-            'gm_acc': {t: float((gm_rel_arr < t).mean() * 100) for t in [10, 20]},
-            'gds_acc': {t: float((gds_rel_arr < t).mean() * 100) for t in [10, 20]},
+            'gm_acc': {t: float((gm_rel_arr < t).mean() * 100) for t in [10, 20, 50]},
+            'gds_acc': {t: float((gds_rel_arr < t).mean() * 100) for t in [10, 20, 50]},
             'gm_median': float(np.median(gm_rel_arr)),
             'gds_median': float(np.median(gds_rel_arr)),
+            'gm_log_mae': float(gm_log_arr.mean()),
+            'gm_log_median': float(np.median(gm_log_arr)),
+            'gds_log_mae': float(gds_log_arr.mean()),
+            'gds_log_median': float(np.median(gds_log_arr)),
         }
 
     return results
@@ -173,20 +185,42 @@ def format_results(r):
     lines.append('==================================================')
     lines.append('=== RELATIVE ERROR ANALYSIS ===')
     lines.append('==================================================')
-    lines.append(f'Best Val MAE: {r["v_mae_mv"]:.2f}mV (median rel: {r["v_rel_median"]:.2f}%, mean rel: {r["v_rel_mean"]:.2f}%)')
-    lines.append(f'Best Val Current MAE: {r["i_mae_ua"]:.1f}µA (median rel: {r["i_rel_median"]:.2f}%, mean rel: {r["i_rel_mean"]:.2f}%)')
+    lines.append(f'Best Val MAE: {r["v_mae_mv"]:.2f}mV (median rel: {r["v_rel_median"]:.2f}%)')
+    if r['i_mae_ua'] > 0:
+        lines.append(f'Best Val Current MAE: {r["i_mae_ua"]:.1f}µA (median rel: {r["i_rel_median"]:.2f}%)')
 
+    va = r['v_abs_acc']
+    ia = r['i_abs_acc']
     vr = r['v_rel_acc']
     ir = r['i_rel_acc']
-    lines.append(f'Voltage Rel Acc @1%: {vr[1]:5.2f}% | Current Rel Acc @1%: {ir[1]:5.2f}%')
-    lines.append(f'Voltage Rel Acc @5%: {vr[5]:5.2f}% | Current Rel Acc @5%: {ir[5]:5.2f}%')
-    lines.append(f'Voltage Rel Acc@10%: {vr[10]:5.2f}% | Current Rel Acc@10%: {ir[10]:5.2f}%')
-    lines.append(f'Voltage Rel Acc@20%: {vr[20]:5.2f}% | Current Rel Acc@20%: {ir[20]:5.2f}%')
+    if r['i_mae_ua'] > 0:
+        lines.append(f'Voltage Abs Acc @80mV: {va[80]:5.2f}% | Current Abs Acc @50uA: {ia[50]:5.2f}%')
+        lines.append(f'Voltage Abs Acc @50mV: {va[50]:5.2f}% | Current Abs Acc @20uA: {ia[20]:5.2f}%')
+        lines.append(f'Voltage Abs Acc @20mV: {va[20]:5.2f}% | Current Abs Acc  @5uA: {ia[5]:5.2f}%')
+        lines.append(f'Voltage Abs Acc @10mV: {va[10]:5.2f}% | Current Abs Acc  @2uA: {ia[2]:5.2f}%')
+        lines.append(f'Voltage Rel Acc  @1%: {vr[1]:5.2f}% | Current Rel Acc  @1%: {ir[1]:5.2f}%')
+        lines.append(f'Voltage Rel Acc  @5%: {vr[5]:5.2f}% | Current Rel Acc  @5%: {ir[5]:5.2f}%')
+        lines.append(f'Voltage Rel Acc @10%: {vr[10]:5.2f}% | Current Rel Acc @10%: {ir[10]:5.2f}%')
+        lines.append(f'Voltage Rel Acc @20%: {vr[20]:5.2f}% | Current Rel Acc @20%: {ir[20]:5.2f}%')
+    else:
+        lines.append(f'Voltage Abs Acc @80mV: {va[80]:5.2f}%')
+        lines.append(f'Voltage Abs Acc @50mV: {va[50]:5.2f}%')
+        lines.append(f'Voltage Abs Acc @20mV: {va[20]:5.2f}%')
+        lines.append(f'Voltage Abs Acc @10mV: {va[10]:5.2f}%')
+        lines.append(f'Voltage Rel Acc  @1%: {vr[1]:5.2f}%')
+        lines.append(f'Voltage Rel Acc  @5%: {vr[5]:5.2f}%')
+        lines.append(f'Voltage Rel Acc @10%: {vr[10]:5.2f}%')
+        lines.append(f'Voltage Rel Acc @20%: {vr[20]:5.2f}%')
 
     ss = r.get('ss_metrics')
     if ss is not None:
-        lines.append(f'gm  Acc@10%: {ss["gm_acc"][10]:5.1f}% (median: {ss["gm_median"]:.1f}%) | gds Acc@10%: {ss["gds_acc"][10]:5.1f}% (median: {ss["gds_median"]:.1f}%)')
-        lines.append(f'gm  Acc@20%: {ss["gm_acc"][20]:5.1f}% | gds Acc@20%: {ss["gds_acc"][20]:5.1f}%')
+        lines.append(f'')
+        lines.append(f'--- SS Evaluation ---')
+        lines.append(f'gm  MAE: {ss["gm_log_mae"]:.3f} log10  (median {ss["gm_log_median"]:.3f}, median rel: {ss["gm_median"]:.1f}%)')
+        lines.append(f'gds MAE: {ss["gds_log_mae"]:.3f} log10  (median {ss["gds_log_median"]:.3f}, median rel: {ss["gds_median"]:.1f}%)')
+        lines.append(f'gm  Acc @10%: {ss["gm_acc"][10]:5.1f}% | gds Acc @10%: {ss["gds_acc"][10]:5.1f}%')
+        lines.append(f'gm  Acc @20%: {ss["gm_acc"][20]:5.1f}% | gds Acc @20%: {ss["gds_acc"][20]:5.1f}%')
+        lines.append(f'gm  Acc @50%: {ss["gm_acc"][50]:5.1f}% | gds Acc @50%: {ss["gds_acc"][50]:5.1f}%')
 
     lines.append('')
 

@@ -410,6 +410,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     all_i_rel_errors = []
     all_gm_rel = []
     all_gds_rel = []
+    all_gm_log_errors = []
+    all_gds_log_errors = []
 
     for batch in loader:
         needs_transfer = str(batch.x.device).split(':')[0] != str(device).split(':')[0]
@@ -577,6 +579,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
                 gds_rel = ((torch.pow(10, gds_pred_log) - torch.pow(10, gds_tgt_log)).abs() / torch.pow(10, gds_tgt_log).clamp(min=1e-15) * 100)
                 all_gm_rel.extend(gm_rel.cpu().tolist())
                 all_gds_rel.extend(gds_rel.cpu().tolist())
+                all_gm_log_errors.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
+                all_gds_log_errors.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
         total_triode_physics_loss += triode_physics_loss.float() * batch_size
         total_triode_eq1_loss += triode_eq1_loss.float() * batch_size
         total_triode_eq2_loss += triode_eq2_loss.float() * batch_size
@@ -647,11 +651,17 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     if all_gm_rel:
         gm_rel_arr = np.array(all_gm_rel)
         gds_rel_arr = np.array(all_gds_rel)
+        gm_log_arr = np.array(all_gm_log_errors)
+        gds_log_arr = np.array(all_gds_log_errors)
         ss_metrics = {
-            'gm_acc': {t: float((gm_rel_arr < t).mean() * 100) for t in [10, 20]},
-            'gds_acc': {t: float((gds_rel_arr < t).mean() * 100) for t in [10, 20]},
+            'gm_acc': {t: float((gm_rel_arr < t).mean() * 100) for t in [10, 20, 50]},
+            'gds_acc': {t: float((gds_rel_arr < t).mean() * 100) for t in [10, 20, 50]},
             'gm_median': float(np.median(gm_rel_arr)),
             'gds_median': float(np.median(gds_rel_arr)),
+            'gm_log_mae': float(gm_log_arr.mean()),
+            'gm_log_median': float(np.median(gm_log_arr)),
+            'gds_log_mae': float(gds_log_arr.mean()),
+            'gds_log_median': float(np.median(gds_log_arr)),
         }
 
     rel_metrics = {

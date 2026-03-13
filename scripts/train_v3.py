@@ -1266,106 +1266,60 @@ def main():
 
     # Print summary
     training_time = time.time() - training_start_time
+    rm = best_metrics.get('rel_metrics') or {}
+    ia = rm.get('i_abs_acc', {})
+    vr = rm.get('v_rel_acc', {})
+    ir = rm.get('i_rel_acc', {})
+    ss_m = rm.get('ss_metrics')
+
     print(f"\n{'='*50}\n=== TRAINING COMPLETE ===\n{'='*50}")
     print(f"Training time: {training_time:.1f}s ({training_time/60:.1f} min)")
     print(f"Best Val Loss: {best_val_loss:.4f} at epoch {best_epoch}")
-    print(f"Best Val MAE: {best_metrics['val_mae_mv']:.2f}mV")
-    if predict_currents:
-        print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA")
-    ia = best_metrics.get('rel_metrics', {}).get('i_abs_acc', {})
-    if predict_currents and ia:
-        print(f"Val Accuracy@80mV: {best_metrics['acc80']:5.2f}% | Current @50uA: {ia[50]:5.2f}%")
-        print(f"Val Accuracy@50mV: {best_metrics['acc50']:5.2f}% | Current @20uA: {ia[20]:5.2f}%")
-        print(f"Val Accuracy@20mV: {best_metrics['acc20']:5.2f}% | Current @5uA:  {ia[5]:5.2f}%")
-        print(f"Val Accuracy@10mV: {best_metrics['acc10']:5.2f}% | Current @2uA:  {ia[2]:5.2f}%")
+    if rm:
+        print(f"Best Val MAE: {best_metrics['val_mae_mv']:.2f}mV (median rel: {rm['v_rel_median']:.2f}%)")
     else:
-        print(f"Val Accuracy@80mV: {best_metrics['acc80']:.2f}%")
-        print(f"Val Accuracy@50mV: {best_metrics['acc50']:.2f}%")
-        print(f"Val Accuracy@20mV: {best_metrics['acc20']:.2f}%")
-        print(f"Val Accuracy@10mV: {best_metrics['acc10']:.2f}%")
-    ss_m = best_metrics.get('rel_metrics', {}).get('ss_metrics')
-    if ss_m is not None:
-        print(f"gm  Acc@10%: {ss_m['gm_acc'][10]:5.1f}% | gds Acc@10%: {ss_m['gds_acc'][10]:5.1f}%")
-        print(f"gm  Acc@20%: {ss_m['gm_acc'][20]:5.1f}% | gds Acc@20%: {ss_m['gds_acc'][20]:5.1f}%")
-
-    # Relative error analysis block
-    rm = best_metrics.get('rel_metrics')
-    if rm is not None:
-        print(f"\n{'='*50}\n=== RELATIVE ERROR ANALYSIS ===\n{'='*50}")
-        print(f"Best Val MAE: {best_metrics['val_mae_mv']:.2f}mV (median rel: {rm['v_rel_median']:.2f}%, mean rel: {rm['v_rel_mean']:.2f}%)")
-        if predict_currents:
-            print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA (median rel: {rm['i_rel_median']:.2f}%, mean rel: {rm['i_rel_mean']:.2f}%)")
-        vr = rm['v_rel_acc']
-        ir = rm['i_rel_acc']
-        if predict_currents:
-            print(f"Voltage Rel Acc @1%: {vr[1]:5.2f}% | Current Rel Acc @1%: {ir[1]:5.2f}%")
-            print(f"Voltage Rel Acc @5%: {vr[5]:5.2f}% | Current Rel Acc @5%: {ir[5]:5.2f}%")
-            print(f"Voltage Rel Acc@10%: {vr[10]:5.2f}% | Current Rel Acc@10%: {ir[10]:5.2f}%")
-            print(f"Voltage Rel Acc@20%: {vr[20]:5.2f}% | Current Rel Acc@20%: {ir[20]:5.2f}%")
+        print(f"Best Val MAE: {best_metrics['val_mae_mv']:.2f}mV")
+    if predict_currents:
+        if rm:
+            print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA (median rel: {rm['i_rel_median']:.2f}%)")
         else:
-            print(f"Voltage Rel Acc @1%: {vr[1]:5.2f}%")
-            print(f"Voltage Rel Acc @5%: {vr[5]:5.2f}%")
-            print(f"Voltage Rel Acc@10%: {vr[10]:5.2f}%")
-            print(f"Voltage Rel Acc@20%: {vr[20]:5.2f}%")
-        ss_rm = rm.get('ss_metrics')
-        if ss_rm is not None:
-            print(f"gm  Acc@10%: {ss_rm['gm_acc'][10]:5.1f}% (median: {ss_rm['gm_median']:.1f}%) | gds Acc@10%: {ss_rm['gds_acc'][10]:5.1f}% (median: {ss_rm['gds_median']:.1f}%)")
-            print(f"gm  Acc@20%: {ss_rm['gm_acc'][20]:5.1f}% | gds Acc@20%: {ss_rm['gds_acc'][20]:5.1f}%")
+            print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA")
 
-    # End-of-training SS and AC evaluation on best model
+    if predict_currents and ia:
+        print(f"Voltage Abs Acc @80mV: {best_metrics['acc80']:5.2f}% | Current Abs Acc @50uA: {ia[50]:5.2f}%")
+        print(f"Voltage Abs Acc @50mV: {best_metrics['acc50']:5.2f}% | Current Abs Acc @20uA: {ia[20]:5.2f}%")
+        print(f"Voltage Abs Acc @20mV: {best_metrics['acc20']:5.2f}% | Current Abs Acc  @5uA: {ia[5]:5.2f}%")
+        print(f"Voltage Abs Acc @10mV: {best_metrics['acc10']:5.2f}% | Current Abs Acc  @2uA: {ia[2]:5.2f}%")
+    else:
+        print(f"Voltage Abs Acc @80mV: {best_metrics['acc80']:.2f}%")
+        print(f"Voltage Abs Acc @50mV: {best_metrics['acc50']:.2f}%")
+        print(f"Voltage Abs Acc @20mV: {best_metrics['acc20']:.2f}%")
+        print(f"Voltage Abs Acc @10mV: {best_metrics['acc10']:.2f}%")
+
+    if vr:
+        if predict_currents:
+            print(f"Voltage Rel Acc  @1%: {vr[1]:5.2f}% | Current Rel Acc  @1%: {ir[1]:5.2f}%")
+            print(f"Voltage Rel Acc  @5%: {vr[5]:5.2f}% | Current Rel Acc  @5%: {ir[5]:5.2f}%")
+            print(f"Voltage Rel Acc @10%: {vr[10]:5.2f}% | Current Rel Acc @10%: {ir[10]:5.2f}%")
+            print(f"Voltage Rel Acc @20%: {vr[20]:5.2f}% | Current Rel Acc @20%: {ir[20]:5.2f}%")
+        else:
+            print(f"Voltage Rel Acc  @1%: {vr[1]:5.2f}%")
+            print(f"Voltage Rel Acc  @5%: {vr[5]:5.2f}%")
+            print(f"Voltage Rel Acc @10%: {vr[10]:5.2f}%")
+            print(f"Voltage Rel Acc @20%: {vr[20]:5.2f}%")
+
+    if ss_m is not None:
+        print(f"\n--- SS Evaluation ---")
+        print(f"gm  MAE: {ss_m['gm_log_mae']:.3f} log10  (median {ss_m['gm_log_median']:.3f}, median rel: {ss_m['gm_median']:.1f}%)")
+        print(f"gds MAE: {ss_m['gds_log_mae']:.3f} log10  (median {ss_m['gds_log_median']:.3f}, median rel: {ss_m['gds_median']:.1f}%)")
+        print(f"gm  Acc @10%: {ss_m['gm_acc'][10]:5.1f}% | gds Acc @10%: {ss_m['gds_acc'][10]:5.1f}%")
+        print(f"gm  Acc @20%: {ss_m['gm_acc'][20]:5.1f}% | gds Acc @20%: {ss_m['gds_acc'][20]:5.1f}%")
+        print(f"gm  Acc @50%: {ss_m['gm_acc'][50]:5.1f}% | gds Acc @50%: {ss_m['gds_acc'][50]:5.1f}%")
+
+    # End-of-training AC and region evaluation on best model
     if best_model_state is not None and val_loader:
         model.load_state_dict(best_model_state)
         model.eval()
-
-        # SS evaluation: denormalized MAE in log10 space
-        if ss_loss_weight_target > 0 and has_ss:
-            all_gm_errors = []
-            all_gds_errors = []
-            all_gm_rel_errors = []
-            all_gds_rel_errors = []
-            with torch.no_grad():
-                for batch in val_loader:
-                    if hasattr(batch, 'to'):
-                        batch = batch.to(args.device)
-                    out_dict = model(batch)
-                    gm_pred = out_dict.get('mosfet_gm_pred')
-                    gds_pred = out_dict.get('mosfet_gds_pred')
-                    if gm_pred is None:
-                        break
-                    mask = batch.mosfet_drain_mask
-                    if mask.any():
-                        # Denormalize: z-score back to log10 space
-                        gm_pred_log = gm_pred[mask] * ss_gm_std + ss_gm_mean
-                        gm_target_log = batch.node_log_gm[mask] * ss_gm_std + ss_gm_mean
-                        gds_pred_log = gds_pred[mask] * ss_gds_std + ss_gds_mean
-                        gds_target_log = batch.node_log_gds[mask] * ss_gds_std + ss_gds_mean
-                        all_gm_errors.extend((gm_pred_log - gm_target_log).abs().cpu().tolist())
-                        all_gds_errors.extend((gds_pred_log - gds_target_log).abs().cpu().tolist())
-                        # Store linear-scale values for relative % error
-                        gm_pred_lin = torch.pow(10, gm_pred_log)
-                        gm_target_lin = torch.pow(10, gm_target_log)
-                        gds_pred_lin = torch.pow(10, gds_pred_log)
-                        gds_target_lin = torch.pow(10, gds_target_log)
-                        gm_rel = ((gm_pred_lin - gm_target_lin).abs() / gm_target_lin.clamp(min=1e-15) * 100).cpu().tolist()
-                        gds_rel = ((gds_pred_lin - gds_target_lin).abs() / gds_target_lin.clamp(min=1e-15) * 100).cpu().tolist()
-                        all_gm_rel_errors.extend(gm_rel)
-                        all_gds_rel_errors.extend(gds_rel)
-
-            if all_gm_errors:
-                gm_errs = np.array(all_gm_errors)
-                gds_errs = np.array(all_gds_errors)
-                # log10 error of X means prediction is off by 10^X factor
-                print(f"\n--- SS Evaluation (best model, val set) ---")
-                print(f"  gm  MAE: {gm_errs.mean():.3f} log10  (median {np.median(gm_errs):.3f})")
-                print(f"  gds MAE: {gds_errs.mean():.3f} log10  (median {np.median(gds_errs):.3f})")
-                gm_rel = np.array(all_gm_rel_errors)
-                gds_rel = np.array(all_gds_rel_errors)
-                print(f"  gm  within 10%:  {100*np.mean(gm_rel < 10):.1f}%")
-                print(f"  gm  within 20%:  {100*np.mean(gm_rel < 20):.1f}%")
-                print(f"  gm  within 50%:  {100*np.mean(gm_rel < 50):.1f}%")
-                print(f"  gds within 10%:  {100*np.mean(gds_rel < 10):.1f}%")
-                print(f"  gds within 20%:  {100*np.mean(gds_rel < 20):.1f}%")
-                print(f"  gds within 50%:  {100*np.mean(gds_rel < 50):.1f}%")
 
         # AC evaluation: denormalized MAE in real units
         if ac_loss_weight_target > 0 and ac_mean is not None and ac_components:
