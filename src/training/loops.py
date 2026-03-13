@@ -403,9 +403,13 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     total_current_mae = 0
     total_current_count = 0
     all_errors = []
+    all_rel_errors = []
     all_current_errors = []
     all_current_preds = []
     all_current_targets = []
+    all_i_rel_errors = []
+    all_gm_rel = []
+    all_gds_rel = []
 
     for batch in loader:
         needs_transfer = str(batch.x.device).split(':')[0] != str(device).split(':')[0]
@@ -538,6 +542,11 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             all_current_errors.extend(current_errors_ua.cpu().tolist())
             all_current_preds.extend(current_pred_orig.cpu().tolist())
             all_current_targets.extend(current_target_orig.cpu().tolist())
+            # Relative error for currents above 1nA floor
+            above_floor = current_target_orig.abs() > 1e-9
+            if above_floor.any():
+                i_rel = (current_errors_ua[above_floor] * 1e-6) / current_target_orig[above_floor].abs() * 100
+                all_i_rel_errors.extend(i_rel.cpu().tolist())
 
         batch_size = len(target)
         total_loss += loss.float() * batch_size
@@ -555,6 +564,19 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             total_ac_loss += ac_loss.float() * batch_size
         if ss_loss_weight > 0:
             total_ss_loss += ss_loss.float() * batch_size
+            # Collect SS relative errors for accuracy metrics
+            gm_pred = out_dict.get('mosfet_gm_pred')
+            gds_pred = out_dict.get('mosfet_gds_pred')
+            drain_mask = getattr(batch, 'mosfet_drain_mask', None)
+            if gm_pred is not None and drain_mask is not None and drain_mask.any():
+                gm_pred_log = gm_pred[drain_mask] * ss_gm_std + ss_gm_mean
+                gm_tgt_log = batch.node_log_gm[drain_mask] * ss_gm_std + ss_gm_mean
+                gds_pred_log = gds_pred[drain_mask] * ss_gds_std + ss_gds_mean
+                gds_tgt_log = batch.node_log_gds[drain_mask] * ss_gds_std + ss_gds_mean
+                gm_rel = ((torch.pow(10, gm_pred_log) - torch.pow(10, gm_tgt_log)).abs() / torch.pow(10, gm_tgt_log).clamp(min=1e-15) * 100)
+                gds_rel = ((torch.pow(10, gds_pred_log) - torch.pow(10, gds_tgt_log)).abs() / torch.pow(10, gds_tgt_log).clamp(min=1e-15) * 100)
+                all_gm_rel.extend(gm_rel.cpu().tolist())
+                all_gds_rel.extend(gds_rel.cpu().tolist())
         total_triode_physics_loss += triode_physics_loss.float() * batch_size
         total_triode_eq1_loss += triode_eq1_loss.float() * batch_size
         total_triode_eq2_loss += triode_eq2_loss.float() * batch_size
@@ -574,8 +596,12 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             pred_mv, target_mv = denormalize_voltage(pred, target, vdc_mean, vdc_std)
         errors_mv = (pred_mv - target_mv).abs()
         all_errors.extend(errors_mv.cpu().tolist())
+        rel_errors_pct = errors_mv / torch.clamp(target_mv.abs(), min=1.0) * 100
+        all_rel_errors.extend(rel_errors_pct.cpu().tolist())
 
     all_errors = np.array(all_errors)
+    all_rel_errors = np.array(all_rel_errors)
+    all_i_rel_errors = np.array(all_i_rel_errors) if all_i_rel_errors else np.array([])
 
     avg_loss = (total_loss / total_count).item()
     avg_voltage_loss = (total_voltage_loss / total_count).item()
@@ -607,7 +633,35 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     avg_cutoff_physics_loss = (total_cutoff_physics_loss / total_count).item()
     avg_region_loss = (total_region_loss / total_count).item() if region_loss_weight > 0 else 0.0
 
-    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss
+    # Relative error metrics
+    v_rel_median = float(np.median(all_rel_errors)) if len(all_rel_errors) > 0 else 0.0
+    v_rel_mean = float(all_rel_errors.mean()) if len(all_rel_errors) > 0 else 0.0
+    v_rel_acc = {t: float((all_rel_errors < t).mean() * 100) for t in [1, 5, 10, 20]}
+    i_rel_median = float(np.median(all_i_rel_errors)) if len(all_i_rel_errors) > 0 else 0.0
+    i_rel_mean = float(all_i_rel_errors.mean()) if len(all_i_rel_errors) > 0 else 0.0
+    i_rel_acc = {t: float((all_i_rel_errors < t).mean() * 100) for t in [1, 5, 10, 20]} if len(all_i_rel_errors) > 0 else {t: 0.0 for t in [1, 5, 10, 20]}
+    all_current_errors_np = np.array(all_current_errors) if all_current_errors else np.array([])
+    i_abs_acc = {t: float((all_current_errors_np < t).mean() * 100) for t in [50, 20, 5, 2]} if len(all_current_errors_np) > 0 else {t: 0.0 for t in [50, 20, 5, 2]}
+    # SS accuracy metrics
+    ss_metrics = None
+    if all_gm_rel:
+        gm_rel_arr = np.array(all_gm_rel)
+        gds_rel_arr = np.array(all_gds_rel)
+        ss_metrics = {
+            'gm_acc': {t: float((gm_rel_arr < t).mean() * 100) for t in [10, 20]},
+            'gds_acc': {t: float((gds_rel_arr < t).mean() * 100) for t in [10, 20]},
+            'gm_median': float(np.median(gm_rel_arr)),
+            'gds_median': float(np.median(gds_rel_arr)),
+        }
+
+    rel_metrics = {
+        'v_rel_median': v_rel_median, 'v_rel_mean': v_rel_mean, 'v_rel_acc': v_rel_acc,
+        'i_rel_median': i_rel_median, 'i_rel_mean': i_rel_mean, 'i_rel_acc': i_rel_acc,
+        'i_abs_acc': i_abs_acc,
+        'ss_metrics': ss_metrics,
+    }
+
+    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics
 
 
 def validate_simple(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,

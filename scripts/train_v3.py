@@ -663,7 +663,7 @@ def main():
     train_maes, train_current_maes, val_current_maes, learning_rates = [], [], [], []
     epochs_without_improvement = 0
     best_model_state = None
-    best_metrics = {'val_mae_mv': float('inf'), 'val_current_mae_ua': 0.0, 'acc80': 0.0, 'acc50': 0.0, 'acc20': 0.0, 'acc10': 0.0, 'current_acc50': 0.0, 'current_acc20': 0.0, 'current_acc10': 0.0, 'current_acc5': 0.0}
+    best_metrics = {'val_mae_mv': float('inf'), 'val_current_mae_ua': 0.0, 'acc80': 0.0, 'acc50': 0.0, 'acc20': 0.0, 'acc10': 0.0, 'current_acc50': 0.0, 'current_acc20': 0.0, 'current_acc10': 0.0, 'current_acc5': 0.0, 'rel_metrics': None}
 
     early_stopping_patience = getattr(args, 'early_stopping_patience', 80)
     val_freq = getattr(args, 'val_freq', 1)
@@ -949,7 +949,7 @@ def main():
 
         # Validation
         if val_loader and epoch % val_freq == 0:
-            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss = validate(
+            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss, val_rel_metrics = validate(
                 model, val_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                 predict_currents=predict_currents, current_weight=current_weight,
                 voltage_weight=getattr(args, 'voltage_weight', 1.0),
@@ -1001,7 +1001,8 @@ def main():
                 best_model_state = model.state_dict()
                 epochs_without_improvement = 0
                 best_metrics.update(val_mae_mv=val_mae_mv, val_current_mae_ua=val_c_mae, acc80=acc80, acc50=acc50, acc20=acc20, acc10=acc10,
-                                     current_acc50=current_acc50, current_acc20=current_acc20, current_acc10=current_acc10, current_acc5=current_acc5)
+                                     current_acc50=current_acc50, current_acc20=current_acc20, current_acc10=current_acc10, current_acc5=current_acc5,
+                                     rel_metrics=val_rel_metrics)
             else:
                 epochs_without_improvement += 1
 
@@ -1030,7 +1031,7 @@ def main():
 
             # Detailed progress every 50 epochs
             if epoch > 0 and epoch % 50 == 0:
-                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss = validate(
+                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss, _tr_rel_metrics = validate(
                     model, train_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                     predict_currents=predict_currents, current_weight=current_weight,
                     voltage_weight=getattr(args, 'voltage_weight', 1.0),
@@ -1271,16 +1272,45 @@ def main():
     print(f"Best Val MAE: {best_metrics['val_mae_mv']:.2f}mV")
     if predict_currents:
         print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA")
-    if predict_currents:
-        print(f"Val Accuracy@80mV: {best_metrics['acc80']:5.2f}% | Current @50%: {best_metrics['current_acc50']:5.2f}%")
-        print(f"Val Accuracy@50mV: {best_metrics['acc50']:5.2f}% | Current @20%: {best_metrics['current_acc20']:5.2f}%")
-        print(f"Val Accuracy@20mV: {best_metrics['acc20']:5.2f}% | Current @10%: {best_metrics['current_acc10']:5.2f}%")
-        print(f"Val Accuracy@10mV: {best_metrics['acc10']:5.2f}% | Current @5%:  {best_metrics['current_acc5']:5.2f}%")
+    ia = best_metrics.get('rel_metrics', {}).get('i_abs_acc', {})
+    if predict_currents and ia:
+        print(f"Val Accuracy@80mV: {best_metrics['acc80']:5.2f}% | Current @50uA: {ia[50]:5.2f}%")
+        print(f"Val Accuracy@50mV: {best_metrics['acc50']:5.2f}% | Current @20uA: {ia[20]:5.2f}%")
+        print(f"Val Accuracy@20mV: {best_metrics['acc20']:5.2f}% | Current @5uA:  {ia[5]:5.2f}%")
+        print(f"Val Accuracy@10mV: {best_metrics['acc10']:5.2f}% | Current @2uA:  {ia[2]:5.2f}%")
     else:
         print(f"Val Accuracy@80mV: {best_metrics['acc80']:.2f}%")
         print(f"Val Accuracy@50mV: {best_metrics['acc50']:.2f}%")
         print(f"Val Accuracy@20mV: {best_metrics['acc20']:.2f}%")
         print(f"Val Accuracy@10mV: {best_metrics['acc10']:.2f}%")
+    ss_m = best_metrics.get('rel_metrics', {}).get('ss_metrics')
+    if ss_m is not None:
+        print(f"gm  Acc@10%: {ss_m['gm_acc'][10]:5.1f}% | gds Acc@10%: {ss_m['gds_acc'][10]:5.1f}%")
+        print(f"gm  Acc@20%: {ss_m['gm_acc'][20]:5.1f}% | gds Acc@20%: {ss_m['gds_acc'][20]:5.1f}%")
+
+    # Relative error analysis block
+    rm = best_metrics.get('rel_metrics')
+    if rm is not None:
+        print(f"\n{'='*50}\n=== RELATIVE ERROR ANALYSIS ===\n{'='*50}")
+        print(f"Best Val MAE: {best_metrics['val_mae_mv']:.2f}mV (median rel: {rm['v_rel_median']:.2f}%, mean rel: {rm['v_rel_mean']:.2f}%)")
+        if predict_currents:
+            print(f"Best Val Current MAE: {best_metrics['val_current_mae_ua']:.1f}µA (median rel: {rm['i_rel_median']:.2f}%, mean rel: {rm['i_rel_mean']:.2f}%)")
+        vr = rm['v_rel_acc']
+        ir = rm['i_rel_acc']
+        if predict_currents:
+            print(f"Voltage Rel Acc @1%: {vr[1]:5.2f}% | Current Rel Acc @1%: {ir[1]:5.2f}%")
+            print(f"Voltage Rel Acc @5%: {vr[5]:5.2f}% | Current Rel Acc @5%: {ir[5]:5.2f}%")
+            print(f"Voltage Rel Acc@10%: {vr[10]:5.2f}% | Current Rel Acc@10%: {ir[10]:5.2f}%")
+            print(f"Voltage Rel Acc@20%: {vr[20]:5.2f}% | Current Rel Acc@20%: {ir[20]:5.2f}%")
+        else:
+            print(f"Voltage Rel Acc @1%: {vr[1]:5.2f}%")
+            print(f"Voltage Rel Acc @5%: {vr[5]:5.2f}%")
+            print(f"Voltage Rel Acc@10%: {vr[10]:5.2f}%")
+            print(f"Voltage Rel Acc@20%: {vr[20]:5.2f}%")
+        ss_rm = rm.get('ss_metrics')
+        if ss_rm is not None:
+            print(f"gm  Acc@10%: {ss_rm['gm_acc'][10]:5.1f}% (median: {ss_rm['gm_median']:.1f}%) | gds Acc@10%: {ss_rm['gds_acc'][10]:5.1f}% (median: {ss_rm['gds_median']:.1f}%)")
+            print(f"gm  Acc@20%: {ss_rm['gm_acc'][20]:5.1f}% | gds Acc@20%: {ss_rm['gds_acc'][20]:5.1f}%")
 
     # End-of-training SS and AC evaluation on best model
     if best_model_state is not None and val_loader:
