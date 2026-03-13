@@ -208,6 +208,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['kcl_conservation'] = loss_cfg.get('kcl_conservation', False)  # structural KCL enforcement via projection
     args['kcl_skip_two_term'] = loss_cfg.get('kcl_skip_two_term', False)  # skip 2-term KCL loss (when enforced in architecture)
     args['kcl_only_two_term'] = loss_cfg.get('kcl_only_two_term', False)  # only compute 2-term KCL loss, skip 3+ term nets
+    args['kcl_intermediate_weight'] = loss_cfg.get('kcl_intermediate_weight', 0.0)  # deep supervision: KCL on intermediate state tower layer
     # Soft z-score clipping for current targets (0 to disable)
     args['current_z_clip'] = loss_cfg.get('current_z_clip', 0.0)
 

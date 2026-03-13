@@ -222,8 +222,14 @@ class TowerGENConv(BaseGNN):
             c_hidden = current_head_config.get('hidden_dim', hidden_dim)
             c_dropout = current_head_config.get('dropout', 0.0)
             self.current_head = build_mlp(c_layers, mlp_input_dim, c_hidden, 1, norm_type, c_dropout)
+            # Auxiliary current head for intermediate KCL (after state tower layer 0)
+            if state_tower_layers >= 2:
+                self.aux_current_head = build_mlp(1, hidden_dim, hidden_dim, 1, norm_type, 0.0)
+            else:
+                self.aux_current_head = None
         else:
             self.current_head = None
+            self.aux_current_head = None
 
         # --- Sensitivity Tower (gm/gds) ---
         self.has_sensitivity_tower = ss_head_config.get('enabled', False)
@@ -401,6 +407,9 @@ class TowerGENConv(BaseGNN):
 
         if self.predict_currents and self.current_head is not None:
             result['node_currents'] = self.current_head(state_repr).squeeze(-1)
+            # Auxiliary currents from intermediate state tower layer for deep KCL
+            if self.aux_current_head is not None:
+                result['aux_node_currents'] = self.aux_current_head(state_outputs[1]).squeeze(-1)
 
         # --- Sensitivity Tower ---
         if self.has_sensitivity_tower:

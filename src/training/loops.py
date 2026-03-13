@@ -79,7 +79,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
                 kcl_huber_delta=0.0, kcl_gt_filter=0.1,
                 device_consistency_weight=0.0,
-                intermediate_v_weight=0.0):
+                intermediate_v_weight=0.0,
+                kcl_intermediate_weight=0.0):
     """
     Train for one epoch.
 
@@ -181,7 +182,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 batch, stage2_nodes, stage2_weight, device=device
             ) if not use_terminal_voltage_loss else None
 
-            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss = compute_combined_loss(
+            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss = compute_combined_loss(
                 voltage_pred=pred,
                 voltage_target=target,
                 current_pred=out_currents,
@@ -264,6 +265,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
                 device_consistency_weight=device_consistency_weight,
                 batch=batch,
+                kcl_intermediate_weight=kcl_intermediate_weight,
+                aux_node_currents=out_dict.get('aux_node_currents'),
             )
 
             # Intermediate voltage auxiliary loss
@@ -371,7 +374,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              kcl_detach_backbone=False, kcl_violation_threshold=0.0,
              kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
              kcl_huber_delta=0.0, kcl_gt_filter=0.1, amp_dtype=None,
-             device_consistency_weight=0.0):
+             device_consistency_weight=0.0,
+             kcl_intermediate_weight=0.0):
     """
     Validate the model.
 
@@ -451,7 +455,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             batch, stage2_nodes, stage2_weight, device=device
         ) if not use_terminal_voltage_loss else None
 
-        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss = compute_combined_loss(
+        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss = compute_combined_loss(
             voltage_pred=pred,
             voltage_target=target,
             current_pred=out_currents,
@@ -534,6 +538,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
             device_consistency_weight=device_consistency_weight,
             batch=batch,
+            kcl_intermediate_weight=0.0,  # Don't include intermediate KCL in val loss
+            aux_node_currents=out_dict.get('aux_node_currents'),
         )
 
         # Track current loss and MAE
