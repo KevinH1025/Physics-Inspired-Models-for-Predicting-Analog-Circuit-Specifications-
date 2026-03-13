@@ -1384,6 +1384,9 @@ def compute_combined_loss(
     # Device consistency loss
     device_consistency_weight: float = 0.0,
     batch=None,
+    # Intermediate KCL (deep supervision)
+    kcl_intermediate_weight: float = 0.0,
+    aux_node_currents: torch.Tensor = None,
 ) -> tuple:
     """
     Compute combined loss from all components.
@@ -1455,6 +1458,25 @@ def compute_combined_loss(
 
         kcl_loss, kcl_supervised_mask = compute_kcl_loss(
             kcl_current_pred, edge_index, num_terminals, train_mask, ptr,
+            terminal_current_sign=terminal_current_sign,
+            current_mean=current_mean,
+            current_std=current_std,
+            gt_currents=current_target,
+            kcl_include_mask=kcl_include_mask,
+            kcl_min_current=kcl_min_current,
+            kcl_mode=kcl_mode,
+            kcl_violation_threshold=kcl_violation_threshold,
+            kcl_skip_two_term=kcl_skip_two_term,
+            kcl_only_two_term=kcl_only_two_term,
+            kcl_huber_delta=kcl_huber_delta,
+            kcl_gt_filter=kcl_gt_filter,
+        )
+
+    # Intermediate KCL (deep supervision on auxiliary current predictions)
+    kcl_intermediate_loss = torch.tensor(0.0, device=voltage_loss.device)
+    if kcl_intermediate_weight > 0 and aux_node_currents is not None and edge_index is not None and ptr is not None:
+        kcl_intermediate_loss, _ = compute_kcl_loss(
+            aux_node_currents, edge_index, num_terminals, train_mask, ptr,
             terminal_current_sign=terminal_current_sign,
             current_mean=current_mean,
             current_std=current_std,
@@ -1647,6 +1669,7 @@ def compute_combined_loss(
                   triode_physics_loss_weight * triode_physics_loss +
                   cutoff_physics_loss_weight * cutoff_physics_loss +
                   region_loss_weight * region_loss +
-                  device_consistency_weight * dev_consistency_loss)
+                  device_consistency_weight * dev_consistency_loss +
+                  kcl_intermediate_weight * kcl_intermediate_loss)
 
-    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss
+    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss

@@ -687,6 +687,7 @@ def main():
     kcl_conservation = getattr(args, 'kcl_conservation', False)
     kcl_skip_two_term = getattr(args, 'kcl_skip_two_term', False)
     kcl_only_two_term = getattr(args, 'kcl_only_two_term', False)
+    kcl_intermediate_weight = getattr(args, 'kcl_intermediate_weight', 0.0)
     # Physics constraint config (diff pair, current mirrors)
     constraint_weight_target = getattr(args, 'constraint_weight', 0.0)
     constraint_warmup_epochs = getattr(args, 'constraint_warmup_epochs', 0)
@@ -939,6 +940,7 @@ def main():
             kcl_only_two_term=kcl_only_two_term,
             device_consistency_weight=device_consistency_weight,
             intermediate_v_weight=getattr(args, 'intermediate_v_weight', 0.0),
+            kcl_intermediate_weight=kcl_intermediate_weight,
         )
 
         mae_mv = mae_norm * vdc_std * 1000
