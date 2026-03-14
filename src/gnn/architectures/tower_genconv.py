@@ -260,8 +260,25 @@ class TowerGENConv(BaseGNN):
             ss_hidden = ss_head_config.get('hidden_dim', hidden_dim)
             ss_layers = ss_head_config.get('num_layers', 2)
             ss_dropout = ss_head_config.get('dropout', 0.0)
-            self.gm_head = build_mlp(ss_layers, mlp_input_dim, ss_hidden, 1, norm_type, ss_dropout)
-            self.gds_head = build_mlp(ss_layers, mlp_input_dim, ss_hidden, 1, norm_type, ss_dropout)
+            ss_input_dim = 3 * mlp_input_dim
+            self.gm_head = nn.Sequential(
+                nn.Linear(ss_input_dim, 128),
+                nn.LayerNorm(128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.LayerNorm(64),
+                nn.ReLU(),
+                nn.Linear(64, 1),
+            )
+            self.gds_head = nn.Sequential(
+                nn.Linear(ss_input_dim, 128),
+                nn.LayerNorm(128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.LayerNorm(64),
+                nn.ReLU(),
+                nn.Linear(64, 1),
+            )
         else:
             self.sensitivity_tower = None
             self.sensitivity_jk = None
@@ -427,8 +444,26 @@ class TowerGENConv(BaseGNN):
                 self.sensitivity_jk, sens_outputs, self.sensitivity_tower[0], x_in,
             )
 
-            result['mosfet_gm_pred'] = self.gm_head(sens_repr).squeeze(-1)
-            result['mosfet_gds_pred'] = self.gds_head(sens_repr).squeeze(-1)
+            # Gather gate(0), drain(1), source(2) embeddings per MOSFET
+            mosfet_info = data.mosfet_info.long()
+            mosfet_ptr = getattr(data, 'mosfet_ptr', None)
+            num_mosfets = mosfet_info.shape[0]
+            num_graphs = data.ptr.shape[0] - 1
+            if mosfet_ptr is not None:
+                mg_idx = torch.bucketize(
+                    torch.arange(num_mosfets, device=data.ptr.device),
+                    mosfet_ptr[1:].to(data.ptr.device), right=True)
+            else:
+                mg_idx = torch.arange(num_mosfets, device=data.ptr.device) // (num_mosfets // num_graphs)
+            offsets = data.ptr[mg_idx]
+
+            gate_emb = sens_repr[mosfet_info[:, 0] + offsets]
+            drain_emb = sens_repr[mosfet_info[:, 1] + offsets]
+            source_emb = sens_repr[mosfet_info[:, 2] + offsets]
+            mosfet_repr = torch.cat([gate_emb, drain_emb, source_emb], dim=-1)
+
+            result['mosfet_gm_pred'] = self.gm_head(mosfet_repr).squeeze(-1)
+            result['mosfet_gds_pred'] = self.gds_head(mosfet_repr).squeeze(-1)
 
         return result
 

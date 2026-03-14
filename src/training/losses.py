@@ -1104,33 +1104,40 @@ def compute_triode_physics_loss(
 def compute_ss_loss(
     gm_pred: torch.Tensor,
     gds_pred: torch.Tensor,
-    mosfet_drain_mask: torch.Tensor,
-    node_log_gm: torch.Tensor,
-    node_log_gds: torch.Tensor,
+    mosfet_gm: torch.Tensor,
+    mosfet_gds: torch.Tensor,
+    gm_mean: float,
+    gm_std: float,
+    gds_mean: float,
+    gds_std: float,
 ) -> tuple:
     """
-    Supervised loss for gm/gds predictions using per-node mask.
+    Supervised loss for per-MOSFET gm/gds predictions.
 
-    Predictions are per-node (like voltage/current heads). The mask selects
-    drain terminal nodes where ground truth gm/gds is available.
-    Targets are pre-computed in log10 space.
+    Predictions are per-MOSFET (from gate+drain+source terminal concat).
+    Targets are raw linear-scale mosfet_gm/mosfet_gds, normalized inline.
 
     Args:
-        gm_pred: [num_nodes] predicted log10(gm) for all nodes
-        gds_pred: [num_nodes] predicted log10(gds) for all nodes
-        mosfet_drain_mask: [num_nodes] bool - True at valid drain terminals
-        node_log_gm: [num_nodes] log10(gm) at drain nodes, 0 elsewhere
-        node_log_gds: [num_nodes] log10(gds) at drain nodes, 0 elsewhere
+        gm_pred: [num_mosfets] predicted z-scored log10(gm)
+        gds_pred: [num_mosfets] predicted z-scored log10(gds)
+        mosfet_gm: [num_mosfets] raw gm values (linear scale)
+        mosfet_gds: [num_mosfets] raw gds values (linear scale)
+        gm_mean/gm_std: z-score normalization stats for log10(gm)
+        gds_mean/gds_std: z-score normalization stats for log10(gds)
 
     Returns:
         Tuple of (gm_loss, gds_loss) scalar tensors
     """
     device = gm_pred.device
-    mask = mosfet_drain_mask.to(device)
+    mosfet_gm = mosfet_gm.to(device)
+    mosfet_gds = mosfet_gds.to(device)
+    valid = mosfet_gm > 1e-12
 
-    if mask.any():
-        gm_loss = F.mse_loss(gm_pred[mask], node_log_gm[mask].to(device))
-        gds_loss = F.mse_loss(gds_pred[mask], node_log_gds[mask].to(device))
+    if valid.any():
+        gm_target = (torch.log10(mosfet_gm[valid]) - gm_mean) / gm_std
+        gds_target = (torch.log10(mosfet_gds[valid].clamp(min=1e-20)) - gds_mean) / gds_std
+        gm_loss = F.mse_loss(gm_pred[valid], gm_target)
+        gds_loss = F.mse_loss(gds_pred[valid], gds_target)
     else:
         gm_loss = torch.tensor(0.0, device=device)
         gds_loss = torch.tensor(0.0, device=device)
@@ -1356,14 +1363,13 @@ def compute_combined_loss(
     ac_mean: torch.Tensor = None,
     ac_std: torch.Tensor = None,
     ac_components: list = None,
-    # Supervised gm/gds prediction loss parameters (mask-based)
+    # Supervised gm/gds prediction loss parameters (per-MOSFET)
     ss_gm_loss_weight: float = 0.0,
     ss_gds_loss_weight: float = 0.0,
     ss_gm_pred: torch.Tensor = None,
     ss_gds_pred: torch.Tensor = None,
-    mosfet_drain_mask: torch.Tensor = None,
-    node_log_gm: torch.Tensor = None,
-    node_log_gds: torch.Tensor = None,
+    mosfet_gm: torch.Tensor = None,
+    mosfet_gds: torch.Tensor = None,
     # Triode physics regularizer loss parameters
     triode_physics_loss_weight: float = 0.0,
     triode_physics_config: dict = None,
@@ -1381,6 +1387,7 @@ def compute_combined_loss(
     region_loss_weight: float = 0.0,
     region_pred: torch.Tensor = None,
     node_region_labels: torch.Tensor = None,
+    mosfet_drain_mask: torch.Tensor = None,
     # Device consistency loss
     device_consistency_weight: float = 0.0,
     batch=None,
@@ -1535,9 +1542,9 @@ def compute_combined_loss(
 
     constraint_loss = diff_pair_loss + mirror_loss + output_stage_loss + lambda_mirror_loss
 
-    # gm physics self-consistency loss (always compute for monitoring; weight controls total_loss)
+    # gm physics self-consistency loss
     gm_physics_loss = torch.tensor(0.0, device=voltage_loss.device)
-    if ss_gm_pred is not None and current_pred is not None and full_voltage_pred is not None:
+    if gm_physics_loss_weight > 0 and ss_gm_pred is not None and current_pred is not None and full_voltage_pred is not None:
         gm_physics_loss = compute_gm_physics_loss(
             ss_gm_pred=ss_gm_pred,
             pred_currents=current_pred,
@@ -1576,16 +1583,19 @@ def compute_combined_loss(
             ac_am=ac_am,
         )
 
-    # Supervised gm/gds prediction loss (mask-based)
+    # Supervised gm/gds prediction loss (per-MOSFET)
     ss_gm_loss = torch.tensor(0.0, device=voltage_loss.device)
     ss_gds_loss = torch.tensor(0.0, device=voltage_loss.device)
-    if (ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0) and ss_gm_pred is not None and ss_gds_pred is not None and mosfet_drain_mask is not None:
+    if (ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0) and ss_gm_pred is not None and ss_gds_pred is not None and mosfet_gm is not None:
         ss_gm_loss, ss_gds_loss = compute_ss_loss(
             gm_pred=ss_gm_pred,
             gds_pred=ss_gds_pred,
-            mosfet_drain_mask=mosfet_drain_mask,
-            node_log_gm=node_log_gm,
-            node_log_gds=node_log_gds,
+            mosfet_gm=mosfet_gm,
+            mosfet_gds=mosfet_gds,
+            gm_mean=ss_gm_mean,
+            gm_std=ss_gm_std,
+            gds_mean=ss_gds_mean,
+            gds_std=ss_gds_std,
         )
 
     # Triode physics regularizer loss

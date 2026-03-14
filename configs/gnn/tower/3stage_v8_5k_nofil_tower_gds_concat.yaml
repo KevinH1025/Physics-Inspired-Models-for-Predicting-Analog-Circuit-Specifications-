@@ -1,0 +1,107 @@
+# 3-stage opamp v8: Tower architecture with per-MOSFET gm/gds (gate+drain+source concat)
+
+data:
+  path: datasets/opamp_3stage_fan_smc_v8_5k_nofil
+  prebatched: true
+  max_preload_variants: 10
+  preload_to_gpu: true
+
+model:
+  type: tower_genconv
+  hidden_dim: 128
+  genconv_num_layers: 2
+  norm_type: layer
+  skip_connection: true
+  gradient_checkpointing: true
+  dropout: 0.0
+
+  tower:
+    backbone_layers: 6
+    state_tower_layers: 2
+    sensitivity_tower_layers: 2
+    backbone_jk:
+      mode: cat
+      attention: true
+    state_tower_jk:
+      mode: cat
+    sensitivity_tower_jk:
+      mode: cat
+
+  virtual_node:
+    enabled: true
+    learn_temperature: false
+    attention_pooling: true
+
+  heads:
+    voltage:
+      num_layers: 1
+      hidden_dim: 128
+      dropout: 0.0
+    current:
+      enabled: true
+      num_layers: 2
+      hidden_dim: 128
+      dropout: 0.0
+    ss:
+      enabled: true
+      num_layers: 2
+      hidden_dim: 128
+    ac:
+      enabled: false
+    current_gnn:
+      enabled: false
+
+loss:
+  type: mse
+  huber_delta: 1.0
+  current_weight: 1.0
+  current_warmup_epochs: 0
+
+  kcl_weight: 0.0
+  kcl_gt_filter: 0.0
+  kcl_intermediate_weight: 0.0
+
+  stage2_weight: 1.0
+  stage2_nodes: [vout, vout_stage1, vg2, vc]
+  current_constraints:
+    weight: 0.0
+
+  gm_physics_loss:
+    weight: 0.0
+
+  triode_physics_loss:
+    weight: 0.0
+
+  ss_loss:
+    gm_weight: 1.0
+    gds_weight: 1.0
+  ac_loss:
+    weight: 0.0
+
+optimizer:
+  lr: 0.003
+  weight_decay: 0.0
+
+scheduler:
+  type: plateau
+  warmup_epochs: 10
+  patience: 25
+  factor: 0.5
+  min_lr: 1.0e-6
+
+training:
+  epochs: 5000
+  batch_size: 1
+  gradient_clip: 1.0
+  val_freq: 5
+  early_stopping_patience: 80
+  seed: 88
+
+normalization:
+  target_type: zscore
+  vdd: 1.8
+
+output:
+  save_best: true
+  save_final: false
+  log_interval: 5

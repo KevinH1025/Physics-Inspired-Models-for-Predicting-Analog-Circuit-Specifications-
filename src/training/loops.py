@@ -249,9 +249,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 ss_gds_loss_weight=ss_gds_loss_weight,
                 ss_gm_pred=out_dict.get('mosfet_gm_pred'),
                 ss_gds_pred=out_dict.get('mosfet_gds_pred'),
-                mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
-                node_log_gm=batch.node_log_gm if hasattr(batch, 'node_log_gm') else None,
-                node_log_gds=batch.node_log_gds if hasattr(batch, 'node_log_gds') else None,
+                mosfet_gm=batch.mosfet_gm if hasattr(batch, 'mosfet_gm') else None,
+                mosfet_gds=batch.mosfet_gds if hasattr(batch, 'mosfet_gds') else None,
                 triode_physics_loss_weight=triode_physics_loss_weight,
                 triode_physics_config=triode_physics_config,
                 cutoff_physics_loss_weight=cutoff_physics_loss_weight,
@@ -263,6 +262,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 region_loss_weight=region_loss_weight,
                 region_pred=out_dict.get('mosfet_region_pred'),
                 node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
+                mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
                 device_consistency_weight=device_consistency_weight,
                 batch=batch,
                 kcl_intermediate_weight=kcl_intermediate_weight,
@@ -522,9 +522,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             ss_gds_loss_weight=ss_gds_loss_weight,
             ss_gm_pred=out_dict.get('mosfet_gm_pred'),
             ss_gds_pred=out_dict.get('mosfet_gds_pred'),
-            mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
-            node_log_gm=batch.node_log_gm if hasattr(batch, 'node_log_gm') else None,
-            node_log_gds=batch.node_log_gds if hasattr(batch, 'node_log_gds') else None,
+            mosfet_gm=batch.mosfet_gm if hasattr(batch, 'mosfet_gm') else None,
+            mosfet_gds=batch.mosfet_gds if hasattr(batch, 'mosfet_gds') else None,
             triode_physics_loss_weight=0.0,  # Don't include triode physics regularizer in val loss
             triode_physics_config=triode_physics_config,
             cutoff_physics_loss_weight=0.0,  # Don't include cutoff physics regularizer in val loss
@@ -536,6 +535,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             region_loss_weight=region_loss_weight,
             region_pred=out_dict.get('mosfet_region_pred'),
             node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
+            mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
             device_consistency_weight=device_consistency_weight,
             batch=batch,
             kcl_intermediate_weight=0.0,  # Don't include intermediate KCL in val loss
@@ -581,21 +581,24 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         if ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0:
             total_ss_gm_loss += ss_gm_loss.float() * batch_size
             total_ss_gds_loss += ss_gds_loss.float() * batch_size
-            # Collect SS relative errors for accuracy metrics
+            # Collect SS relative errors for accuracy metrics (per-MOSFET predictions)
             gm_pred = out_dict.get('mosfet_gm_pred')
             gds_pred = out_dict.get('mosfet_gds_pred')
-            drain_mask = getattr(batch, 'mosfet_drain_mask', None)
-            if gm_pred is not None and drain_mask is not None and drain_mask.any():
-                gm_pred_log = gm_pred[drain_mask] * ss_gm_std + ss_gm_mean
-                gm_tgt_log = batch.node_log_gm[drain_mask] * ss_gm_std + ss_gm_mean
-                gds_pred_log = gds_pred[drain_mask] * ss_gds_std + ss_gds_mean
-                gds_tgt_log = batch.node_log_gds[drain_mask] * ss_gds_std + ss_gds_mean
-                gm_rel = ((torch.pow(10, gm_pred_log) - torch.pow(10, gm_tgt_log)).abs() / torch.pow(10, gm_tgt_log).clamp(min=1e-15) * 100)
-                gds_rel = ((torch.pow(10, gds_pred_log) - torch.pow(10, gds_tgt_log)).abs() / torch.pow(10, gds_tgt_log).clamp(min=1e-15) * 100)
-                all_gm_rel.extend(gm_rel.cpu().tolist())
-                all_gds_rel.extend(gds_rel.cpu().tolist())
-                all_gm_log_errors.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
-                all_gds_log_errors.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
+            mosfet_gm = getattr(batch, 'mosfet_gm', None)
+            mosfet_gds = getattr(batch, 'mosfet_gds', None)
+            if gm_pred is not None and mosfet_gm is not None:
+                valid = mosfet_gm > 1e-12
+                if valid.any():
+                    gm_pred_log = gm_pred[valid] * ss_gm_std + ss_gm_mean
+                    gm_tgt_log = torch.log10(mosfet_gm[valid].to(gm_pred.device))
+                    gds_pred_log = gds_pred[valid] * ss_gds_std + ss_gds_mean
+                    gds_tgt_log = torch.log10(mosfet_gds[valid].to(gds_pred.device).clamp(min=1e-20))
+                    gm_rel = ((torch.pow(10, gm_pred_log) - torch.pow(10, gm_tgt_log)).abs() / torch.pow(10, gm_tgt_log).clamp(min=1e-15) * 100)
+                    gds_rel = ((torch.pow(10, gds_pred_log) - torch.pow(10, gds_tgt_log)).abs() / torch.pow(10, gds_tgt_log).clamp(min=1e-15) * 100)
+                    all_gm_rel.extend(gm_rel.cpu().tolist())
+                    all_gds_rel.extend(gds_rel.cpu().tolist())
+                    all_gm_log_errors.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
+                    all_gds_log_errors.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
         total_triode_physics_loss += triode_physics_loss.float() * batch_size
         total_triode_eq1_loss += triode_eq1_loss.float() * batch_size
         total_triode_eq2_loss += triode_eq2_loss.float() * batch_size

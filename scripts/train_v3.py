@@ -1133,16 +1133,19 @@ def main():
                                 _out = model(_b)
                                 _gm_p, _gds_p = _out.get('mosfet_gm_pred'), _out.get('mosfet_gds_pred')
                                 if _gm_p is None: break
-                                _m = getattr(_b, 'mosfet_drain_mask', None)
-                                if _m is not None and _m.any():
-                                    gm_pred_log = _gm_p[_m] * ss_gm_std + ss_gm_mean
-                                    gm_tgt_log = _b.node_log_gm[_m] * ss_gm_std + ss_gm_mean
-                                    gds_pred_log = _gds_p[_m] * ss_gds_std + ss_gds_mean
-                                    gds_tgt_log = _b.node_log_gds[_m] * ss_gds_std + ss_gds_mean
-                                    _gm_e.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
-                                    _gds_e.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
-                                    _gm_rel.extend(((10**gm_pred_log - 10**gm_tgt_log).abs() / (10**gm_tgt_log).clamp(min=1e-15) * 100).cpu().tolist())
-                                    _gds_rel.extend(((10**gds_pred_log - 10**gds_tgt_log).abs() / (10**gds_tgt_log).clamp(min=1e-15) * 100).cpu().tolist())
+                                _mosfet_gm = getattr(_b, 'mosfet_gm', None)
+                                _mosfet_gds = getattr(_b, 'mosfet_gds', None)
+                                if _mosfet_gm is not None:
+                                    _valid = _mosfet_gm > 1e-12
+                                    if _valid.any():
+                                        gm_pred_log = _gm_p[_valid] * ss_gm_std + ss_gm_mean
+                                        gm_tgt_log = torch.log10(_mosfet_gm[_valid].to(_gm_p.device))
+                                        gds_pred_log = _gds_p[_valid] * ss_gds_std + ss_gds_mean
+                                        gds_tgt_log = torch.log10(_mosfet_gds[_valid].to(_gds_p.device).clamp(min=1e-20))
+                                        _gm_e.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
+                                        _gds_e.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
+                                        _gm_rel.extend(((10**gm_pred_log - 10**gm_tgt_log).abs() / (10**gm_tgt_log).clamp(min=1e-15) * 100).cpu().tolist())
+                                        _gds_rel.extend(((10**gds_pred_log - 10**gds_tgt_log).abs() / (10**gds_tgt_log).clamp(min=1e-15) * 100).cpu().tolist())
                         return (np.array(_gm_e) if _gm_e else None, np.array(_gds_e) if _gds_e else None,
                                 np.array(_gm_rel) if _gm_rel else None, np.array(_gds_rel) if _gds_rel else None)
                     _tr_gm, _tr_gds, _tr_gm_r, _tr_gds_r = _eval_ss(train_loader)
