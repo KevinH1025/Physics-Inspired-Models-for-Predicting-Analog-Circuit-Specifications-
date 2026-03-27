@@ -299,10 +299,12 @@ class DeepGENConv(BaseGNN):
                 # Device-level pooling: predict one current per device from terminal embeddings
                 from src.gnn.components.device_current_head import DevicePoolingCurrentHead
                 c_hidden = current_head_config.get('hidden_dim', 256)
+                c_layers = current_head_config.get('num_layers', 2)
                 c_dropout = current_head_config.get('dropout', 0.0)
                 self.device_current_head = DevicePoolingCurrentHead(
                     embed_dim=mlp_input_dim,
                     hidden_dim=c_hidden,
+                    num_layers=c_layers,
                     dropout=c_dropout,
                     norm_type=norm_type,
                 )
@@ -351,7 +353,7 @@ class DeepGENConv(BaseGNN):
             self.delta_v_head = None
 
         # gm/gds prediction head (optional): predicts per-MOSFET small-signal params
-        # from drain terminal node embeddings (after backbone + JK + skip)
+        # from terminal embeddings (gate+drain+source [+bulk] concat)
         # Output: [log10(gm), log10(gds)] per MOSFET device
         ss_head_config = kwargs.get('ss_head_config', None)
         self.predict_ss = ss_head_config is not None and ss_head_config.get('enabled', False)
@@ -359,9 +361,34 @@ class DeepGENConv(BaseGNN):
             ss_hidden = ss_head_config.get('hidden_dim', hidden_dim)
             ss_layers = ss_head_config.get('num_layers', 2)
             ss_dropout = ss_head_config.get('dropout', 0.0)
-            # Input: drain terminal embedding from backbone (mlp_input_dim)
-            self.gm_head = build_mlp(ss_layers, mlp_input_dim, ss_hidden, 1, norm_type, ss_dropout)
-            self.gds_head = build_mlp(ss_layers, mlp_input_dim, ss_hidden, 1, norm_type, ss_dropout)
+            self.ss_include_bulk = ss_head_config.get('include_bulk', False)
+            self.ss_pool_mode = ss_head_config.get('pool_mode', 'concat')  # 'concat' or 'drain'
+            if self.ss_pool_mode == 'drain':
+                ss_input_dim = mlp_input_dim
+            else:
+                n_terms = 4 if self.ss_include_bulk else 3
+                ss_input_dim = n_terms * mlp_input_dim
+
+            # Shrinking pyramid MLP (matches tower_genconv _build_ss_head)
+            def _build_ss_head(in_dim, hidden_dim, num_layers, dp):
+                layers = []
+                curr_dim = in_dim
+                for i in range(num_layers):
+                    out_dim = hidden_dim // (2 ** i) if num_layers > 1 else hidden_dim
+                    out_dim = max(out_dim, 1)
+                    layers.extend([
+                        nn.Linear(curr_dim, out_dim),
+                        nn.LayerNorm(out_dim),
+                        nn.ReLU(),
+                    ])
+                    if dp > 0:
+                        layers.append(nn.Dropout(dp))
+                    curr_dim = out_dim
+                layers.append(nn.Linear(curr_dim, 1))
+                return nn.Sequential(*layers)
+
+            self.gm_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
+            self.gds_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
 
         # Region head (optional): ordinal regression for operating region per MOSFET
         # Output: single scalar per node (cutoff=0, triode=1, saturation=2)
@@ -1059,7 +1086,7 @@ class DeepGENConv(BaseGNN):
 
             elif self.use_device_pooling_current:
                 # Device-level pooling: one current per device
-                result['node_currents'] = self.device_current_head(
+                node_currents, device_mask, _ = self.device_current_head(
                     x=x,
                     mosfet_info=getattr(data, 'mosfet_info', None),
                     resistor_info=getattr(data, 'resistor_info', None),
@@ -1073,6 +1100,8 @@ class DeepGENConv(BaseGNN):
                     capacitor_ptr=getattr(data, 'capacitor_ptr', None),
                     isource_ptr=getattr(data, 'isource_ptr', None),
                 )
+                result['node_currents'] = node_currents
+                result['device_current_mask'] = device_mask
             else:
                 # Traditional independent current prediction
                 result['node_currents'] = self.current_head(x).squeeze(-1)
@@ -1084,11 +1113,32 @@ class DeepGENConv(BaseGNN):
                     result['node_currents'], data
                 )
 
-        # gm/gds prediction head: predict for ALL nodes, mask to drains in loss
-        # (same pattern as voltage/current heads — avoids manual batch index offsetting)
+        # gm/gds prediction head: gather terminal embeddings per MOSFET
         if self.predict_ss:
-            result['mosfet_gm_pred'] = self.gm_head(x).squeeze(-1)  # [num_nodes]
-            result['mosfet_gds_pred'] = self.gds_head(x).squeeze(-1)  # [num_nodes]
+            mosfet_info = getattr(data, 'mosfet_info', None)
+            if mosfet_info is not None and mosfet_info.numel() > 0:
+                ptr = data.ptr
+                mosfet_ptr = getattr(data, 'mosfet_ptr', None)
+                if mosfet_ptr is not None:
+                    graph_idx = torch.bucketize(
+                        torch.arange(len(mosfet_info), device=x.device),
+                        mosfet_ptr[1:], right=True)
+                    offsets = ptr[graph_idx]
+                else:
+                    offsets = 0
+                drain_emb = x[mosfet_info[:, 1] + offsets]
+                if self.ss_pool_mode == 'drain':
+                    ss_input = drain_emb
+                else:
+                    gate_emb = x[mosfet_info[:, 0] + offsets]
+                    source_emb = x[mosfet_info[:, 2] + offsets]
+                    parts = [gate_emb, drain_emb, source_emb]
+                    if self.ss_include_bulk:
+                        bulk_emb = x[mosfet_info[:, 2] + 1 + offsets]
+                        parts.append(bulk_emb)
+                    ss_input = torch.cat(parts, dim=-1)
+                result['mosfet_gm_pred'] = self.gm_head(ss_input).squeeze(-1)   # [num_mosfets]
+                result['mosfet_gds_pred'] = self.gds_head(ss_input).squeeze(-1)  # [num_mosfets]
 
         # Region head: ordinal regression for ALL nodes, mask to drains in loss
         if self.predict_region:

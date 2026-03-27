@@ -54,6 +54,10 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     vn_cfg = model_cfg.get('virtual_node', {})
     args['virtual_node'] = vn_cfg.get('enabled', model_cfg.get('use_virtual_node', False))
     args['vn_learn_temperature'] = vn_cfg.get('learn_temperature', model_cfg.get('vn_learn_temperature', False))
+    args['vn_gate_broadcast'] = vn_cfg.get('gate_broadcast', False)
+    args['vn_mode'] = vn_cfg.get('mode', 'default')
+    args['vn_num_heads'] = vn_cfg.get('num_heads', 4)
+    args['vn_head_dim'] = vn_cfg.get('head_dim', 32)
     args['use_attention_pooling'] = vn_cfg.get('attention_pooling', model_cfg.get('use_attention_pooling', True))
 
     # JK - support both nested and flat formats
@@ -95,6 +99,9 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Device-level pooling current head
     args['use_device_pooling_current'] = current_cfg.get('device_pooling', False)
+    # Autograd SS: derive gm/gds via autograd through current head
+    if current_cfg.get('autograd_ss', False):
+        args['current_head_config']['autograd_ss'] = True
 
     # Device aggregation layer (device virtual node)
     device_agg_cfg = model_cfg.get('device_aggregation', {})
@@ -131,11 +138,31 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'enabled': ac_head_cfg.get('enabled', False),
         'hidden_dim': ac_head_cfg.get('hidden_dim', 128),
         'num_layers': ac_head_cfg.get('num_layers', 3),
-        'dropout': ac_head_cfg.get('dropout', 0.1),
+        'dropout': ac_head_cfg.get('dropout', 0.0),
         'predict_ugbw': ac_head_cfg.get('predict_ugbw', True),
         'predict_pm': ac_head_cfg.get('predict_pm', True),
         'predict_am': ac_head_cfg.get('predict_am', False),
-        'readout': ac_head_cfg.get('readout', 'vn'),  # 'vn' or 'pool'
+        'readout': ac_head_cfg.get('readout', 'vn'),  # 'vn', 'pool', or 'cross_attn'
+        'num_heads': ac_head_cfg.get('num_heads', 8),
+        'head_dim': ac_head_cfg.get('head_dim', 48),
+    }
+
+    # DC gain prediction head (graph-level, from sensitivity tower)
+    dc_gain_cfg = heads_cfg.get('dc_gain', {})
+    args['dc_gain_config'] = {
+        'enabled': dc_gain_cfg.get('enabled', False),
+        'mode': dc_gain_cfg.get('mode', 'cross_attn'),  # 'cross_attn' or 'physics'
+        'num_heads': dc_gain_cfg.get('num_heads', 4),
+        'head_dim': dc_gain_cfg.get('head_dim', 32),
+        'dropout': dc_gain_cfg.get('dropout', 0.0),
+        # Physics mode settings
+        'hidden_dim': dc_gain_cfg.get('hidden_dim', 64),
+        'num_layers': dc_gain_cfg.get('num_layers', 2),
+        'detach_ss': dc_gain_cfg.get('detach_ss', False),
+        'r_in': dc_gain_cfg.get('r_in', 50000.0),
+        'r_f': dc_gain_cfg.get('r_f', 50000.0),
+        'use_vn_context': dc_gain_cfg.get('use_vn_context', False),
+        'vn_projection_dim': dc_gain_cfg.get('vn_projection_dim', 0),
     }
 
     # gm/gds (small-signal) prediction head
@@ -147,6 +174,53 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'dropout': ss_head_cfg.get('dropout', 0.0),
         'state_conditioned': ss_head_cfg.get('state_conditioned', False),
         'detach_state': ss_head_cfg.get('detach_state', True),
+        'diff_features': ss_head_cfg.get('diff_features', False),
+        'include_bulk': ss_head_cfg.get('include_bulk', False),
+        'state_context': ss_head_cfg.get('state_context', False),
+        'physics_pool': ss_head_cfg.get('physics_pool', False),
+        'voltage_context': ss_head_cfg.get('voltage_context', False),
+        'cross_attention': ss_head_cfg.get('cross_attention', False),
+        'pairwise': ss_head_cfg.get('pairwise', False),
+        'current_context': ss_head_cfg.get('current_context', False),
+        'vov_context': ss_head_cfg.get('vov_context', False),
+        'head_type': ss_head_cfg.get('head_type', 'mlp'),
+        'num_attn_layers': ss_head_cfg.get('num_attn_layers', 1),
+        'num_heads': ss_head_cfg.get('num_heads', 4),
+        'shared_layers': ss_head_cfg.get('shared_layers', 0),
+        'sensitivity_branch_layers': ss_head_cfg.get('sensitivity_branch_layers', 0),
+        'source': ss_head_cfg.get('source', 'sensitivity_tower'),
+        'region_context': ss_head_cfg.get('region_context', False),
+        'wl_context': ss_head_cfg.get('wl_context', False),
+        'vth_context': ss_head_cfg.get('vth_context', False),
+        'mixture_of_experts': ss_head_cfg.get('mixture_of_experts', False),
+        'expert_hidden_dim': ss_head_cfg.get('expert_hidden_dim', 256),
+        'expert_num_layers': ss_head_cfg.get('expert_num_layers', 2),
+    }
+    # Differentiable I-V model config (nested under ss head)
+    iv_cfg = ss_head_cfg.get('iv_model', {})
+    args['ss_head_config']['iv_model'] = {
+        'enabled': iv_cfg.get('enabled', False),
+        'hidden_dim': iv_cfg.get('hidden_dim', 256),
+        'num_layers': iv_cfg.get('num_layers', 3),
+        'dropout': iv_cfg.get('dropout', 0.0),
+        'detach_voltages': iv_cfg.get('detach_voltages', True),
+        'detach_embeddings': iv_cfg.get('detach_embeddings', True),
+        'residual': iv_cfg.get('residual', False),
+        'embed_dim': iv_cfg.get('embed_dim', 64),
+    }
+
+    # Vov prediction head
+    vov_head_cfg = heads_cfg.get('vov', {})
+    args['vov_head_config'] = {
+        'enabled': vov_head_cfg.get('enabled', False),
+        'hidden_dim': vov_head_cfg.get('hidden_dim', 128),
+    }
+
+    # Vth prediction head
+    vth_head_cfg = heads_cfg.get('vth', {})
+    args['vth_head_config'] = {
+        'enabled': vth_head_cfg.get('enabled', False),
+        'hidden_dim': vth_head_cfg.get('hidden_dim', 128),
     }
 
     # Region classification head
@@ -181,6 +255,17 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['backbone_jk_config'] = tower_cfg.get('backbone_jk', {})
     args['state_tower_jk_config'] = tower_cfg.get('state_tower_jk', {})
     args['sensitivity_tower_jk_config'] = tower_cfg.get('sensitivity_tower_jk', {})
+
+    # Loop attention config
+    loop_attn_cfg = tower_cfg.get('loop_attention', {})
+    args['loop_attention_config'] = {
+        'enabled': loop_attn_cfg.get('enabled', False),
+        'num_heads': loop_attn_cfg.get('num_heads', 4),
+        'head_dim': loop_attn_cfg.get('head_dim', 32),
+        'apply_to': loop_attn_cfg.get('apply_to', 'backbone'),
+        'fusion': loop_attn_cfg.get('fusion', 'add'),
+        'warmup_epochs': loop_attn_cfg.get('warmup_epochs', 0),
+    }
 
     # Loss - support both nested and flat formats
     loss_cfg = config.get('loss', {})
@@ -265,6 +350,12 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['ac_loss_start_epoch'] = ac_cfg.get('start_epoch', 0)
     args['ac_loss_warmup_epochs'] = ac_cfg.get('warmup_epochs', 0)
 
+    # DC gain prediction loss
+    dc_gain_loss_cfg = loss_cfg.get('dc_gain_loss', {})
+    args['dc_gain_loss_weight'] = dc_gain_loss_cfg.get('weight', 0.0)
+    args['dc_gain_warmup_epochs'] = dc_gain_loss_cfg.get('warmup_epochs', 0)
+    args['dc_gain_start_epoch'] = dc_gain_loss_cfg.get('start_epoch', 0)
+
     # Device consistency loss
     args['device_consistency_weight'] = loss_cfg.get('device_consistency_weight', 0.0)
 
@@ -279,12 +370,30 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['ss_gds_loss_weight'] = ss_cfg.get('gds_weight', ss_cfg.get('weight', 0.0))
     args['ss_loss_start_epoch'] = ss_cfg.get('start_epoch', 0)
     args['ss_loss_warmup_epochs'] = ss_cfg.get('warmup_epochs', 0)
+    args['ss_huber_delta'] = ss_cfg.get('huber_delta', 0.0)  # 0 = MSE, >0 = Huber
+    args['ss_per_region_norm'] = ss_cfg.get('per_region_norm', False)
+
+    # IV model ID prediction loss (drain current from differentiable I-V model)
+    iv_id_cfg = loss_cfg.get('iv_id_loss', {})
+    args['iv_id_loss_weight'] = iv_id_cfg.get('weight', 0.0)
+
+    # Vov prediction loss
+    vov_loss_cfg = loss_cfg.get('vov_loss', {})
+    args['vov_loss_weight'] = vov_loss_cfg.get('weight', 0.0)
+
+    # Vth prediction loss
+    vth_loss_cfg = loss_cfg.get('vth_loss', {})
+    args['vth_loss_weight'] = vth_loss_cfg.get('weight', 0.0)
+
+    # Uncertainty weighting (Kendall et al. 2018)
+    args['use_uncertainty_weighting'] = loss_cfg.get('uncertainty_weighting', False)
 
     # Optimizer - support both nested and flat formats
     optim_cfg = config.get('optimizer', {})
     train_cfg_preview = config.get('training', {})
     args['lr'] = optim_cfg.get('lr', train_cfg_preview.get('learning_rate', 0.003))
     args['weight_decay'] = optim_cfg.get('weight_decay', train_cfg_preview.get('weight_decay', 0.0))
+    args['adam_eps'] = optim_cfg.get('eps', 1e-8)
 
     # Scheduler - support both nested and flat formats
     sched_cfg = config.get('scheduler', {})

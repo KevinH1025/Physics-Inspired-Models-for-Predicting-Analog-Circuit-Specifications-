@@ -16,10 +16,12 @@ Memory footprint for 16k samples (3-stage opamp):
 
 import pickle
 import random
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
+import networkx as nx
 import torch
 
 
@@ -56,6 +58,23 @@ class FixedTopologyDataset:
         self.num_terminals = g0.num_terminals
         self.num_resistors = g0.resistor_info.shape[0]
         self.num_capacitors = g0.capacitor_info.shape[0]
+
+        # Loop attention data — compute from topology if available in graph,
+        # otherwise derive from existing device info + edge_index
+        if hasattr(g0, 'loop_edge_index') and g0.loop_edge_index is not None:
+            self.loop_edge_index = g0.loop_edge_index.to(device)
+            self.device_terminal_map = g0.device_terminal_map.to(device)
+            self.num_devices = g0.device_terminal_map.shape[0]
+        else:
+            lei, dtm = self._compute_loop_info(g0)
+            if lei is not None:
+                self.loop_edge_index = lei.to(device)
+                self.device_terminal_map = dtm.to(device)
+                self.num_devices = dtm.shape[0]
+            else:
+                self.loop_edge_index = None
+                self.device_terminal_map = None
+                self.num_devices = 0
 
         # ── Variable tensors (stacked across all samples) ─────────────────
         self.all_x = torch.stack([s['graph'].x for s in samples]).to(device)
@@ -138,6 +157,8 @@ class FixedTopologyDataset:
                 [s['graph'].ac_valid.item() if hasattr(s['graph'], 'ac_valid') and s['graph'].ac_valid is not None
                  else True for s in samples], dtype=torch.bool
             ).to(device)
+            # Filter out samples with dc_gain <= 0 (broken circuits)
+            self.all_ac_valid &= (self.all_ac_dc_gain > 0)
         else:
             self.all_ac_dc_gain = None
             self.all_ac_ugbw = None
@@ -189,6 +210,99 @@ class FixedTopologyDataset:
         self.ss_gds_mean = gds_mean
         self.ss_gds_std = gds_std
 
+    # ── Loop info from topology ─────────────────────────────────────────
+
+    @staticmethod
+    def _compute_loop_info(g0) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Derive loop_edge_index and device_terminal_map from existing graph topology.
+
+        Uses mosfet_info, resistor_info, capacitor_info to identify devices
+        and their terminal node indices, then builds a device-level graph
+        and detects cycles with NetworkX.
+        """
+        num_terminals = getattr(g0, 'num_terminals', None)
+        if num_terminals is None:
+            return None, None
+
+        # Collect all devices and their terminal indices
+        device_terms = []  # list of lists of terminal indices
+        device_nets = []   # list of sets of net indices
+
+        # MOSFETs: columns [gate_term, drain_term, source_term, gate_net, drain_net, source_net, is_nmos]
+        # Terminal creation order per MOSFET: drain, gate, source, bulk (consecutive)
+        # So drain_term_idx is the lowest, bulk = drain_term_idx + 3
+        mi = g0.mosfet_info
+        for row in mi:
+            gate_idx, drain_idx, source_idx = row[0].item(), row[1].item(), row[2].item()
+            # Bulk is the 4th terminal: drain is first → bulk = drain + 3
+            bulk_idx = drain_idx + 3
+            terms = [gate_idx, drain_idx, source_idx]
+            if bulk_idx < num_terminals:
+                terms.append(bulk_idx)
+            device_terms.append(terms)
+            device_nets.append({row[3].item(), row[4].item(), row[5].item()})
+
+        # Resistors: columns [term_p, term_n, net_p, net_n, value_idx]
+        ri = getattr(g0, 'resistor_info', None)
+        if ri is not None and ri.shape[0] > 0:
+            for row in ri:
+                device_terms.append([row[0].item(), row[1].item()])
+                device_nets.append({row[2].item(), row[3].item()})
+
+        # Capacitors: columns [term_p, term_n, net_p, net_n]
+        ci = getattr(g0, 'capacitor_info', None)
+        if ci is not None and ci.shape[0] > 0:
+            for row in ci:
+                device_terms.append([row[0].item(), row[1].item()])
+                device_nets.append({row[2].item(), row[3].item()})
+
+        num_devices = len(device_terms)
+        if num_devices == 0:
+            return None, None
+
+        # Build device-level graph: edge if two devices share a net
+        net_to_devs = defaultdict(set)
+        for d, nets in enumerate(device_nets):
+            for net in nets:
+                net_to_devs[net].add(d)
+
+        G = nx.Graph()
+        G.add_nodes_from(range(num_devices))
+        for net, devs in net_to_devs.items():
+            devs = list(devs)
+            for i in range(len(devs)):
+                for j in range(i + 1, len(devs)):
+                    G.add_edge(devs[i], devs[j])
+
+        # Find fundamental cycles
+        cycles = nx.cycle_basis(G)
+
+        # Build loop_edge_index: all pairs within each cycle, bidirectional
+        loop_edges = set()
+        for cycle in cycles:
+            for i in range(len(cycle)):
+                for j in range(i + 1, len(cycle)):
+                    a, b = min(cycle[i], cycle[j]), max(cycle[i], cycle[j])
+                    loop_edges.add((a, b))
+
+        if loop_edges:
+            src, dst = [], []
+            for a, b in loop_edges:
+                src.extend([a, b])
+                dst.extend([b, a])
+            loop_edge_index = torch.tensor([src, dst], dtype=torch.long)
+        else:
+            loop_edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+        # Build device_terminal_map: [D, 4] padded with -1
+        max_terms = 4
+        device_terminal_map = torch.full((num_devices, max_terms), -1, dtype=torch.long)
+        for d, terms in enumerate(device_terms):
+            for t, idx in enumerate(terms[:max_terms]):
+                device_terminal_map[d, t] = idx
+
+        return loop_edge_index, device_terminal_map
+
     # ── Batch template (precomputed fixed parts for a given B) ───────────
 
     def _get_batch_template(self, B: int) -> dict:
@@ -233,6 +347,25 @@ class FixedTopologyDataset:
         kcl_include_mask = self.kcl_include_mask.repeat(B)
         terminal_train_mask = self.terminal_train_mask.repeat(B)
 
+        # Loop attention data (optional)
+        loop_edge_index = None
+        device_terminal_map = None
+        device_ptr = None
+        if self.loop_edge_index is not None:
+            D_per = self.num_devices
+            E_loop = self.loop_edge_index.shape[1]
+            # loop_edge_index: repeat with device offsets
+            dev_offsets = torch.arange(B, device=dev) * D_per
+            loop_edge_offsets = dev_offsets.repeat_interleave(E_loop)
+            loop_edge_index = self.loop_edge_index.repeat(1, B) + loop_edge_offsets.unsqueeze(0)
+            # device_terminal_map: repeat with node offsets, preserve -1 padding
+            dtm = self.device_terminal_map.repeat(B, 1)  # [B*D, 4]
+            node_off = node_offsets.repeat_interleave(D_per)  # [B*D]
+            pad_mask = dtm >= 0
+            dtm[pad_mask] += node_off.unsqueeze(1).expand_as(dtm)[pad_mask]
+            device_terminal_map = dtm
+            device_ptr = torch.arange(B + 1, device=dev) * D_per
+
         tmpl = dict(
             edge_index=edge_index,
             batch_vec=batch_vec,
@@ -250,6 +383,9 @@ class FixedTopologyDataset:
             mosfet_drain_mask=mosfet_drain_mask,
             kcl_include_mask=kcl_include_mask,
             terminal_train_mask=terminal_train_mask,
+            loop_edge_index=loop_edge_index,
+            device_terminal_map=device_terminal_map,
+            device_ptr=device_ptr,
         )
         self._batch_template_cache[B] = tmpl
         return tmpl
@@ -320,6 +456,10 @@ class FixedTopologyDataset:
             capacitor_ptr=t['capacitor_ptr'],
             isource_info=None,
             isource_ptr=None,
+            # loop attention
+            loop_edge_index=t.get('loop_edge_index', None),
+            device_terminal_map=t.get('device_terminal_map', None),
+            device_ptr=t.get('device_ptr', None),
             # masks
             has_current_mask=self.all_has_current_mask[idx].reshape(B * N),
             output_node_mask=t['output_node_mask'],

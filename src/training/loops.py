@@ -72,6 +72,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 ss_gds_mean=0.0, ss_gds_std=1.0,
                 ac_loss_weight=0.0, ac_mean=None, ac_std=None, ac_components=None,
                 ss_gm_loss_weight=0.0, ss_gds_loss_weight=0.0,
+                ss_huber_delta=0.0,
                 triode_physics_loss_weight=0.0, triode_physics_config=None,
                 cutoff_physics_loss_weight=0.0, cutoff_physics_n_nmos=1.5, cutoff_physics_n_pmos=2.0,
                 region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
@@ -80,7 +81,13 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 kcl_huber_delta=0.0, kcl_gt_filter=0.1,
                 device_consistency_weight=0.0,
                 intermediate_v_weight=0.0,
-                kcl_intermediate_weight=0.0):
+                kcl_intermediate_weight=0.0,
+                vov_loss_weight=0.0,
+                vth_loss_weight=0.0,
+                uncertainty_weights=None,
+                ss_region_stats=None,
+                iv_id_loss_weight=0.0,
+                dc_gain_loss_weight=0.0, dc_gain_mean=0.0, dc_gain_std=1.0):
     """
     Train for one epoch.
 
@@ -133,6 +140,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     total_lambda_mirror_loss = 0
     total_gm_physics_loss = 0
     total_ac_loss = 0
+    total_ac_component_losses = {}  # per-component: ugbw, pm, am
     total_ss_gm_loss = 0
     total_ss_gds_loss = 0
     total_triode_physics_loss = 0
@@ -141,6 +149,12 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     total_triode_eq3_loss = 0
     total_cutoff_physics_loss = 0
     total_region_loss = 0
+    total_vov_loss = 0
+    total_vth_loss = 0
+    total_dc_gain_loss = 0
+    max_grad_norm = 0.0
+    sum_grad_norm = 0.0
+    grad_norm_count = 0
 
     use_amp = amp_dtype is not None
 
@@ -171,6 +185,10 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
             out_currents = out_dict.get('node_currents') if predict_currents else None
             current_mask = batch.has_current_mask if predict_currents and out_currents is not None else None
 
+            # Per-device current: use device_current_mask (one terminal per device) to avoid double-counting
+            if current_mask is not None and 'device_current_mask' in out_dict:
+                current_mask = current_mask & out_dict['device_current_mask']
+
             # For voltage-derived currents, use intersection of has_current_mask and voltage_derived_current_mask
             # This ensures we only compute loss on terminals with both targets and predictions
             if current_mask is not None and 'voltage_derived_current_mask' in out_dict:
@@ -182,7 +200,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 batch, stage2_nodes, stage2_weight, device=device
             ) if not use_terminal_voltage_loss else None
 
-            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss = compute_combined_loss(
+            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss = compute_combined_loss(
                 voltage_pred=pred,
                 voltage_target=target,
                 current_pred=out_currents,
@@ -241,7 +259,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 ac_ugbw=batch.ac_ugbw if hasattr(batch, 'ac_ugbw') else None,
                 ac_pm=batch.ac_pm if hasattr(batch, 'ac_pm') else None,
                 ac_am=batch.ac_am if hasattr(batch, 'ac_am') else None,
-                ac_valid=batch.ac_valid if hasattr(batch, 'ac_valid') else None,
+                ac_valid=batch.ac_valid & (batch.ac_dc_gain > 0) if hasattr(batch, 'ac_valid') and hasattr(batch, 'ac_dc_gain') else (batch.ac_valid if hasattr(batch, 'ac_valid') else None),
                 ac_mean=ac_mean,
                 ac_std=ac_std,
                 ac_components=ac_components or out_dict.get('ac_components'),
@@ -251,6 +269,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 ss_gds_pred=out_dict.get('mosfet_gds_pred'),
                 mosfet_gm=batch.mosfet_gm if hasattr(batch, 'mosfet_gm') else None,
                 mosfet_gds=batch.mosfet_gds if hasattr(batch, 'mosfet_gds') else None,
+                ss_huber_delta=ss_huber_delta,
+                ss_region_stats=ss_region_stats,
                 triode_physics_loss_weight=triode_physics_loss_weight,
                 triode_physics_config=triode_physics_config,
                 cutoff_physics_loss_weight=cutoff_physics_loss_weight,
@@ -263,10 +283,25 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 region_pred=out_dict.get('mosfet_region_pred'),
                 node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
                 mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
+                region_logits=out_dict.get('mosfet_region_logits'),
                 device_consistency_weight=device_consistency_weight,
                 batch=batch,
                 kcl_intermediate_weight=kcl_intermediate_weight,
                 aux_node_currents=out_dict.get('aux_node_currents'),
+                vov_loss_weight=vov_loss_weight,
+                vov_pred=out_dict.get('mosfet_vov_pred'),
+                mosfet_vov_valid=getattr(batch, 'mosfet_vov_valid', None),
+                vth_loss_weight=vth_loss_weight,
+                vth_pred=out_dict.get('mosfet_vth_pred'),
+                mosfet_vth=batch.mosfet_vth if hasattr(batch, 'mosfet_vth') else None,
+                uncertainty_weights=uncertainty_weights,
+                iv_id_loss_weight=iv_id_loss_weight,
+                iv_log_abs_id=out_dict.get('mosfet_iv_log_abs_id'),
+                dc_gain_loss_weight=dc_gain_loss_weight,
+                dc_gain_pred=out_dict.get('dc_gain_pred'),
+                dc_gain_target=batch.ac_dc_gain if hasattr(batch, 'ac_dc_gain') else None,
+                dc_gain_mean=dc_gain_mean,
+                dc_gain_std=dc_gain_std,
             )
 
             # Intermediate voltage auxiliary loss
@@ -295,15 +330,22 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
             scaler.scale(loss).backward()
             if gradient_clip > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip).item()
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
             scaler.step(optimizer)
             scaler.update()
         else:
             # bfloat16 or no AMP - no scaling needed
             loss.backward()
             if gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip).item()
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
             optimizer.step()
+        max_grad_norm = max(max_grad_norm, grad_norm)
+        sum_grad_norm += grad_norm
+        grad_norm_count += 1
 
         batch_size = len(target)
         total_loss += loss.detach().float() * batch_size
@@ -319,6 +361,8 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
         total_gm_physics_loss += gm_physics_loss.detach().float() * batch_size
         if ac_loss_weight > 0:
             total_ac_loss += ac_loss.detach().float() * batch_size
+            for comp, comp_loss in ac_per_component.items():
+                total_ac_component_losses[comp] = total_ac_component_losses.get(comp, 0) + comp_loss.detach().float() * batch_size
         if ss_gm_loss_weight > 0:
             total_ss_gm_loss += ss_gm_loss.detach().float() * batch_size
         if ss_gds_loss_weight > 0:
@@ -330,6 +374,12 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
         total_cutoff_physics_loss += cutoff_physics_loss.detach().float() * batch_size
         if region_loss_weight > 0:
             total_region_loss += region_loss.detach().float() * batch_size
+        if vov_loss_weight > 0:
+            total_vov_loss += vov_loss.detach().float() * batch_size
+        if vth_loss_weight > 0:
+            total_vth_loss += vth_loss.detach().float() * batch_size
+        if dc_gain_loss_weight > 0:
+            total_dc_gain_loss += dc_gain_loss.detach().float() * batch_size
 
     avg_loss = (total_loss / total_count).item()
     avg_voltage_loss = (total_voltage_loss / total_count).item()
@@ -343,6 +393,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     avg_lambda_mirror_loss = (total_lambda_mirror_loss / total_count).item() if constraint_weight > 0 else 0.0
     avg_gm_physics_loss = (total_gm_physics_loss / total_count).item()
     avg_ac_loss = (total_ac_loss / total_count).item() if ac_loss_weight > 0 else 0.0
+    avg_ac_component_losses = {comp: (v / total_count).item() for comp, v in total_ac_component_losses.items()} if ac_loss_weight > 0 else {}
     avg_ss_gm_loss = (total_ss_gm_loss / total_count).item() if ss_gm_loss_weight > 0 else 0.0
     avg_ss_gds_loss = (total_ss_gds_loss / total_count).item() if ss_gds_loss_weight > 0 else 0.0
     avg_triode_physics_loss = (total_triode_physics_loss / total_count).item()
@@ -351,11 +402,14 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     avg_triode_eq3_loss = (total_triode_eq3_loss / total_count).item()
     avg_cutoff_physics_loss = (total_cutoff_physics_loss / total_count).item()
     avg_region_loss = (total_region_loss / total_count).item() if region_loss_weight > 0 else 0.0
+    avg_vov_loss = (total_vov_loss / total_count).item() if vov_loss_weight > 0 else 0.0
+    avg_vth_loss = (total_vth_loss / total_count).item() if vth_loss_weight > 0 else 0.0
+    avg_dc_gain_loss = (total_dc_gain_loss / total_count).item() if dc_gain_loss_weight > 0 else 0.0
+    avg_grad_norm = sum_grad_norm / max(grad_norm_count, 1)
 
-    return avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss
+    return avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, avg_vov_loss, avg_vth_loss, avg_ac_component_losses, avg_dc_gain_loss, max_grad_norm, avg_grad_norm
 
 
-@torch.inference_mode()
 def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,
              predict_currents=False, current_weight=1.0, voltage_weight=1.0, kcl_weight=0.0,
              loss_type='mse', huber_delta=1.0, kcl_min_current=1e-9,
@@ -368,6 +422,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              ss_gds_mean=0.0, ss_gds_std=1.0,
              ac_loss_weight=0.0, ac_mean=None, ac_std=None, ac_components=None,
              ss_gm_loss_weight=0.0, ss_gds_loss_weight=0.0,
+             ss_huber_delta=0.0,
              triode_physics_loss_weight=0.0, triode_physics_config=None,
              cutoff_physics_loss_weight=0.0, cutoff_physics_n_nmos=1.5, cutoff_physics_n_pmos=2.0,
              region_loss_weight=0.0, kcl_mode='logsumexp', kcl_exclusive=False,
@@ -375,7 +430,12 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              kcl_conservation=False, kcl_skip_two_term=False, kcl_only_two_term=False,
              kcl_huber_delta=0.0, kcl_gt_filter=0.1, amp_dtype=None,
              device_consistency_weight=0.0,
-             kcl_intermediate_weight=0.0):
+             kcl_intermediate_weight=0.0,
+             vov_loss_weight=0.0,
+             vth_loss_weight=0.0,
+             ss_region_stats=None,
+             iv_id_loss_weight=0.0,
+             dc_gain_loss_weight=0.0, dc_gain_mean=0.0, dc_gain_std=1.0):
     """
     Validate the model.
 
@@ -401,6 +461,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     total_lambda_mirror_loss = 0
     total_gm_physics_loss = 0
     total_ac_loss = 0
+    total_ac_component_losses = {}
     total_ss_gm_loss = 0
     total_ss_gds_loss = 0
     total_triode_physics_loss = 0
@@ -409,6 +470,9 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     total_triode_eq3_loss = 0
     total_cutoff_physics_loss = 0
     total_region_loss = 0
+    total_vov_loss = 0
+    total_vth_loss = 0
+    total_dc_gain_loss = 0
     total_mae = 0
     total_count = 0
     total_current_mae = 0
@@ -423,13 +487,28 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     all_gds_rel = []
     all_gm_log_errors = []
     all_gds_log_errors = []
+    # MoE diagnostics
+    moe_region_probs_sum = None  # running sum of predicted region probs [3]
+    moe_region_correct = 0
+    moe_region_total = 0
+    moe_num_batches = 0
+    moe_per_region_gm_errors = {0: [], 1: [], 2: []}  # cutoff, triode, saturation
+    moe_per_region_gds_errors = {0: [], 1: [], 2: []}
+
+    # Autograd SS needs autograd for torch.autograd.grad — cannot use inference_mode
+    use_autograd = getattr(model, '_needs_autograd', False)
 
     for batch in loader:
         needs_transfer = str(batch.x.device).split(':')[0] != str(device).split(':')[0]
         if needs_transfer:
             batch = batch.to(device, non_blocking=True)
 
-        out_dict = model(batch)
+        if use_autograd:
+            with torch.enable_grad():
+                out_dict = model(batch)
+        else:
+            with torch.inference_mode():
+                out_dict = model(batch)
         out = out_dict['node_voltages']
 
         # Select voltage loss targets
@@ -445,6 +524,10 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         out_currents = out_dict.get('node_currents') if predict_currents else None
         current_mask = batch.has_current_mask if predict_currents and out_currents is not None else None
 
+        # Per-device current: use device_current_mask (one terminal per device) to avoid double-counting
+        if current_mask is not None and 'device_current_mask' in out_dict:
+            current_mask = current_mask & out_dict['device_current_mask']
+
         # For voltage-derived currents, use intersection of has_current_mask and voltage_derived_current_mask
         if current_mask is not None and 'voltage_derived_current_mask' in out_dict:
             voltage_derived_mask = out_dict['voltage_derived_current_mask']
@@ -455,7 +538,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             batch, stage2_nodes, stage2_weight, device=device
         ) if not use_terminal_voltage_loss else None
 
-        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss = compute_combined_loss(
+        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss = compute_combined_loss(
             voltage_pred=pred,
             voltage_target=target,
             current_pred=out_currents,
@@ -514,7 +597,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             ac_ugbw=batch.ac_ugbw if hasattr(batch, 'ac_ugbw') else None,
             ac_pm=batch.ac_pm if hasattr(batch, 'ac_pm') else None,
             ac_am=batch.ac_am if hasattr(batch, 'ac_am') else None,
-            ac_valid=batch.ac_valid if hasattr(batch, 'ac_valid') else None,
+            ac_valid=batch.ac_valid & (batch.ac_dc_gain > 0) if hasattr(batch, 'ac_valid') and hasattr(batch, 'ac_dc_gain') else (batch.ac_valid if hasattr(batch, 'ac_valid') else None),
             ac_mean=ac_mean,
             ac_std=ac_std,
             ac_components=ac_components or out_dict.get('ac_components'),
@@ -524,6 +607,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             ss_gds_pred=out_dict.get('mosfet_gds_pred'),
             mosfet_gm=batch.mosfet_gm if hasattr(batch, 'mosfet_gm') else None,
             mosfet_gds=batch.mosfet_gds if hasattr(batch, 'mosfet_gds') else None,
+            ss_huber_delta=ss_huber_delta,
+            ss_region_stats=ss_region_stats,
             triode_physics_loss_weight=0.0,  # Don't include triode physics regularizer in val loss
             triode_physics_config=triode_physics_config,
             cutoff_physics_loss_weight=0.0,  # Don't include cutoff physics regularizer in val loss
@@ -536,10 +621,23 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             region_pred=out_dict.get('mosfet_region_pred'),
             node_region_labels=batch.node_region_labels if hasattr(batch, 'node_region_labels') else None,
             mosfet_drain_mask=batch.mosfet_drain_mask if hasattr(batch, 'mosfet_drain_mask') else None,
+            region_logits=out_dict.get('mosfet_region_logits'),
             device_consistency_weight=device_consistency_weight,
             batch=batch,
             kcl_intermediate_weight=0.0,  # Don't include intermediate KCL in val loss
             aux_node_currents=out_dict.get('aux_node_currents'),
+            vov_loss_weight=vov_loss_weight,
+            vov_pred=out_dict.get('mosfet_vov_pred'),
+            vth_loss_weight=vth_loss_weight,
+            vth_pred=out_dict.get('mosfet_vth_pred'),
+            mosfet_vth=batch.mosfet_vth if hasattr(batch, 'mosfet_vth') else None,
+            iv_id_loss_weight=iv_id_loss_weight,
+            iv_log_abs_id=out_dict.get('mosfet_iv_log_abs_id'),
+            dc_gain_loss_weight=dc_gain_loss_weight,
+            dc_gain_pred=out_dict.get('dc_gain_pred'),
+            dc_gain_target=batch.ac_dc_gain if hasattr(batch, 'ac_dc_gain') else None,
+            dc_gain_mean=dc_gain_mean,
+            dc_gain_std=dc_gain_std,
         )
 
         # Track current loss and MAE
@@ -578,6 +676,8 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         total_gm_physics_loss += gm_physics_loss.float() * batch_size
         if ac_loss_weight > 0:
             total_ac_loss += ac_loss.float() * batch_size
+            for comp, comp_loss in ac_per_component.items():
+                total_ac_component_losses[comp] = total_ac_component_losses.get(comp, 0) + comp_loss.float() * batch_size
         if ss_gm_loss_weight > 0 or ss_gds_loss_weight > 0:
             total_ss_gm_loss += ss_gm_loss.float() * batch_size
             total_ss_gds_loss += ss_gds_loss.float() * batch_size
@@ -589,9 +689,23 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             if gm_pred is not None and mosfet_gm is not None:
                 valid = mosfet_gm > 1e-12
                 if valid.any():
-                    gm_pred_log = gm_pred[valid] * ss_gm_std + ss_gm_mean
+                    # Denormalize predictions: per-region if available, else global
+                    if ss_region_stats is not None and hasattr(batch, 'mosfet_region_labels'):
+                        labels = batch.mosfet_region_labels.to(gm_pred.device)[valid]
+                        gm_pred_log = torch.empty_like(gm_pred[valid])
+                        gds_pred_log = torch.empty_like(gds_pred[valid])
+                        # Default to global stats
+                        gm_pred_log[:] = gm_pred[valid] * ss_gm_std + ss_gm_mean
+                        gds_pred_log[:] = gds_pred[valid] * ss_gds_std + ss_gds_mean
+                        for r in range(3):
+                            rmask = (labels == r)
+                            if rmask.any():
+                                gm_pred_log[rmask] = gm_pred[valid][rmask] * ss_region_stats[r]['gm_std'] + ss_region_stats[r]['gm_mean']
+                                gds_pred_log[rmask] = gds_pred[valid][rmask] * ss_region_stats[r]['gds_std'] + ss_region_stats[r]['gds_mean']
+                    else:
+                        gm_pred_log = gm_pred[valid] * ss_gm_std + ss_gm_mean
+                        gds_pred_log = gds_pred[valid] * ss_gds_std + ss_gds_mean
                     gm_tgt_log = torch.log10(mosfet_gm[valid].to(gm_pred.device))
-                    gds_pred_log = gds_pred[valid] * ss_gds_std + ss_gds_mean
                     gds_tgt_log = torch.log10(mosfet_gds[valid].to(gds_pred.device).clamp(min=1e-20))
                     gm_rel = ((torch.pow(10, gm_pred_log) - torch.pow(10, gm_tgt_log)).abs() / torch.pow(10, gm_tgt_log).clamp(min=1e-15) * 100)
                     gds_rel = ((torch.pow(10, gds_pred_log) - torch.pow(10, gds_tgt_log)).abs() / torch.pow(10, gds_tgt_log).clamp(min=1e-15) * 100)
@@ -599,6 +713,32 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
                     all_gds_rel.extend(gds_rel.cpu().tolist())
                     all_gm_log_errors.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
                     all_gds_log_errors.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
+
+                    # MoE diagnostics: per-region errors and region head accuracy
+                    region_probs = out_dict.get('mosfet_region_probs')
+                    region_labels = getattr(batch, 'mosfet_region_labels', None)
+                    if region_probs is not None and region_labels is not None:
+                        region_labels = region_labels.to(gm_pred.device)
+                        # Region head accuracy
+                        pred_regions = region_probs.argmax(dim=-1)
+                        moe_region_correct += (pred_regions == region_labels).sum().item()
+                        moe_region_total += region_labels.shape[0]
+                        # Average routing probabilities
+                        batch_probs = region_probs.mean(dim=0).cpu()
+                        if moe_region_probs_sum is None:
+                            moe_region_probs_sum = batch_probs
+                        else:
+                            moe_region_probs_sum = moe_region_probs_sum + batch_probs
+                        moe_num_batches += 1
+                        # Per-region gm/gds log errors (using valid mask)
+                        gm_log_err = (gm_pred_log - gm_tgt_log).abs()
+                        gds_log_err = (gds_pred_log - gds_tgt_log).abs()
+                        valid_labels = region_labels[valid]
+                        for r in range(3):
+                            rmask = (valid_labels == r)
+                            if rmask.any():
+                                moe_per_region_gm_errors[r].extend(gm_log_err[rmask].cpu().tolist())
+                                moe_per_region_gds_errors[r].extend(gds_log_err[rmask].cpu().tolist())
         total_triode_physics_loss += triode_physics_loss.float() * batch_size
         total_triode_eq1_loss += triode_eq1_loss.float() * batch_size
         total_triode_eq2_loss += triode_eq2_loss.float() * batch_size
@@ -606,6 +746,12 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         total_cutoff_physics_loss += cutoff_physics_loss.float() * batch_size
         if region_loss_weight > 0:
             total_region_loss += region_loss.float() * batch_size
+        if vov_loss_weight > 0:
+            total_vov_loss += vov_loss.float() * batch_size
+        if vth_loss_weight > 0:
+            total_vth_loss += vth_loss.float() * batch_size
+        if dc_gain_loss_weight > 0:
+            total_dc_gain_loss += dc_gain_loss.float() * batch_size
 
         # Denormalize for error analysis — always use net-node predictions
         # for fair comparison across runs (regardless of terminal loss setting)
@@ -647,6 +793,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     avg_lambda_mirror_loss = (total_lambda_mirror_loss / total_count).item() if constraint_weight > 0 else 0.0
     avg_gm_physics_loss = (total_gm_physics_loss / total_count).item()
     avg_ac_loss = (total_ac_loss / total_count).item() if ac_loss_weight > 0 else 0.0
+    avg_ac_component_losses = {comp: (v / total_count).item() for comp, v in total_ac_component_losses.items()} if ac_loss_weight > 0 else {}
     avg_ss_gm_loss = (total_ss_gm_loss / total_count).item() if ss_gm_loss_weight > 0 else 0.0
     avg_ss_gds_loss = (total_ss_gds_loss / total_count).item() if ss_gds_loss_weight > 0 else 0.0
     avg_triode_physics_loss = (total_triode_physics_loss / total_count).item()
@@ -655,6 +802,9 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     avg_triode_eq3_loss = (total_triode_eq3_loss / total_count).item()
     avg_cutoff_physics_loss = (total_cutoff_physics_loss / total_count).item()
     avg_region_loss = (total_region_loss / total_count).item() if region_loss_weight > 0 else 0.0
+    avg_vov_loss = (total_vov_loss / total_count).item() if vov_loss_weight > 0 else 0.0
+    avg_vth_loss = (total_vth_loss / total_count).item() if vth_loss_weight > 0 else 0.0
+    avg_dc_gain_loss = (total_dc_gain_loss / total_count).item() if dc_gain_loss_weight > 0 else 0.0
 
     # Relative error metrics
     v_rel_median = float(np.median(all_rel_errors)) if len(all_rel_errors) > 0 else 0.0
@@ -682,6 +832,19 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             'gds_log_mae': float(gds_log_arr.mean()),
             'gds_log_median': float(np.median(gds_log_arr)),
         }
+        # MoE diagnostics
+        if moe_region_total > 0:
+            region_names = ['cutoff', 'triode', 'saturation']
+            ss_metrics['moe_region_acc'] = moe_region_correct / moe_region_total
+            if moe_region_probs_sum is not None and moe_num_batches > 0:
+                avg_probs = moe_region_probs_sum / moe_num_batches
+                ss_metrics['moe_avg_probs'] = avg_probs.tolist()
+            else:
+                ss_metrics['moe_avg_probs'] = None
+            for r, name in enumerate(region_names):
+                if moe_per_region_gm_errors[r]:
+                    ss_metrics[f'moe_gm_mae_{name}'] = float(np.mean(moe_per_region_gm_errors[r]))
+                    ss_metrics[f'moe_gds_mae_{name}'] = float(np.mean(moe_per_region_gds_errors[r]))
 
     rel_metrics = {
         'v_rel_median': v_rel_median, 'v_rel_mean': v_rel_mean, 'v_rel_acc': v_rel_acc,
@@ -690,7 +853,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         'ss_metrics': ss_metrics,
     }
 
-    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics
+    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics, avg_vov_loss, avg_vth_loss, avg_ac_component_losses, avg_dc_gain_loss
 
 
 def validate_simple(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,

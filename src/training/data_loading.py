@@ -8,6 +8,8 @@ and iterating over batches during training.
 import pickle
 import random
 from pathlib import Path
+
+import torch
 from typing import Any, Dict, List
 
 import numpy as np
@@ -58,12 +60,26 @@ class CircuitGraphDataset(Dataset):
         return self.graphs[idx]
 
 
+def _sort_edge_index(batch):
+    """Sort edge_index by destination node for deterministic scatter operations."""
+    if hasattr(batch, 'edge_index') and batch.edge_index.numel() > 0:
+        edge_index = batch.edge_index
+        # Sort by destination (row 1), then source (row 0) for full determinism
+        idx = torch.argsort(edge_index[1] * edge_index.max() + edge_index[0])
+        batch.edge_index = edge_index[:, idx]
+        if hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+            batch.edge_attr = batch.edge_attr[idx]
+    return batch
+
+
 def load_prebatched_variant(split_dir, variant_id: int = 0, device=None) -> List:
     """Load a specific batching variant from a split directory."""
     split_dir = Path(split_dir)
     variant_path = split_dir / f'variant_{variant_id}.pkl'
     with open(variant_path, 'rb') as f:
         batches = pickle.load(f)
+    # Sort edge_index for deterministic scatter operations
+    batches = [_sort_edge_index(batch) for batch in batches]
     if device:
         batches = [batch.to(device) for batch in batches]
     return batches
@@ -413,10 +429,10 @@ def add_mosfet_gt_vov(batches: List) -> None:
             cutoff = (region_labels.to(device) == 0)
             gt_vov[cutoff] = 0.0
 
-        batch.mosfet_gt_vov = gt_vov.clamp(min=0.0)
+        batch.mosfet_gt_vov = gt_vov.clamp(min=0.0, max=1.8)
 
 
-def compute_ss_normalization(train_variants: List[List]) -> tuple:
+def compute_ss_normalization(train_variants: List[List], per_region: bool = False) -> tuple:
     """
     Compute gm/gds normalization statistics from training data.
 
@@ -425,12 +441,18 @@ def compute_ss_normalization(train_variants: List[List]) -> tuple:
 
     Args:
         train_variants: List of training batch variants (after add_ss_node_targets)
+        per_region: If True, also compute per-region (cutoff/triode/sat) stats
 
     Returns:
-        Tuple of (gm_mean, gm_std, gds_mean, gds_std) in log10 space
+        If per_region=False: Tuple of (gm_mean, gm_std, gds_mean, gds_std)
+        If per_region=True: Tuple of (gm_mean, gm_std, gds_mean, gds_std, region_stats)
+            where region_stats = {0: {'gm_mean', 'gm_std', 'gds_mean', 'gds_std'}, 1: ..., 2: ...}
     """
     all_log_gm = []
     all_log_gds = []
+    per_region_gm = {0: [], 1: [], 2: []}
+    per_region_gds = {0: [], 1: [], 2: []}
+
     for variant_batches in train_variants:
         for batch in variant_batches:
             if hasattr(batch, 'mosfet_drain_mask') and hasattr(batch, 'node_log_gm'):
@@ -438,6 +460,17 @@ def compute_ss_normalization(train_variants: List[List]) -> tuple:
                 if mask.any():
                     all_log_gm.extend(batch.node_log_gm[mask].cpu().tolist())
                     all_log_gds.extend(batch.node_log_gds[mask].cpu().tolist())
+
+            if per_region and hasattr(batch, 'mosfet_gm') and hasattr(batch, 'mosfet_region_labels'):
+                gm_raw = batch.mosfet_gm
+                gds_raw = batch.mosfet_gds
+                labels = batch.mosfet_region_labels
+                valid = gm_raw > 1e-12
+                for r in range(3):
+                    rmask = valid & (labels == r)
+                    if rmask.any():
+                        per_region_gm[r].extend(torch.log10(gm_raw[rmask]).cpu().tolist())
+                        per_region_gds[r].extend(torch.log10(gds_raw[rmask].clamp(min=1e-20)).cpu().tolist())
 
     if all_log_gm:
         gm_arr = np.array(all_log_gm)
@@ -454,16 +487,89 @@ def compute_ss_normalization(train_variants: List[List]) -> tuple:
         gm_mean, gm_std = 0.0, 1.0
         gds_mean, gds_std = 0.0, 1.0
 
+    if per_region:
+        region_stats = {}
+        for r in range(3):
+            if per_region_gm[r]:
+                gm_arr_r = np.array(per_region_gm[r])
+                gds_arr_r = np.array(per_region_gds[r])
+                region_stats[r] = {
+                    'gm_mean': float(gm_arr_r.mean()),
+                    'gm_std': max(float(gm_arr_r.std()), 1e-6),
+                    'gds_mean': float(gds_arr_r.mean()),
+                    'gds_std': max(float(gds_arr_r.std()), 1e-6),
+                }
+            else:
+                region_stats[r] = {'gm_mean': gm_mean, 'gm_std': gm_std, 'gds_mean': gds_mean, 'gds_std': gds_std}
+        return gm_mean, gm_std, gds_mean, gds_std, region_stats
+
     return gm_mean, gm_std, gds_mean, gds_std
 
 
 def normalize_batches_ss(batches: List, gm_mean: float, gm_std: float,
-                         gds_mean: float, gds_std: float) -> None:
-    """Normalize SS targets (log10 gm/gds) in batches in-place using z-score."""
+                         gds_mean: float, gds_std: float,
+                         region_stats: dict = None) -> None:
+    """Normalize SS targets (log10 gm/gds) in batches in-place using z-score.
+
+    If region_stats is provided, uses per-region (mean, std) for each MOSFET
+    based on its mosfet_region_labels. Falls back to global stats for unknown regions.
+    """
     for batch in batches:
-        if hasattr(batch, 'node_log_gm') and hasattr(batch, 'mosfet_drain_mask'):
+        if not (hasattr(batch, 'node_log_gm') and hasattr(batch, 'mosfet_drain_mask')):
+            continue
+        if region_stats is not None and hasattr(batch, 'mosfet_region_labels') and hasattr(batch, 'mosfet_info'):
+            labels = batch.mosfet_region_labels
+            gm_raw = batch.mosfet_gm
+            valid = gm_raw > 1e-12
+            drain_idxs = batch.mosfet_info[:, 1].long()
+            for i in range(len(labels)):
+                if not valid[i]:
+                    continue
+                r = labels[i].item()
+                if 0 <= r <= 2:
+                    rs = region_stats[r]
+                else:
+                    rs = {'gm_mean': gm_mean, 'gm_std': gm_std, 'gds_mean': gds_mean, 'gds_std': gds_std}
+                didx = drain_idxs[i].item()
+                batch.node_log_gm[didx] = (batch.node_log_gm[didx] - rs['gm_mean']) / rs['gm_std']
+                batch.node_log_gds[didx] = (batch.node_log_gds[didx] - rs['gds_mean']) / rs['gds_std']
+        else:
             batch.node_log_gm = (batch.node_log_gm - gm_mean) / gm_std
             batch.node_log_gds = (batch.node_log_gds - gds_mean) / gds_std
+
+
+def compute_vov_normalization(train_variants: List[List]) -> tuple:
+    """Compute Vov normalization statistics (log10 z-score) from training data."""
+    all_log_vov = []
+    for variant_batches in train_variants:
+        for batch in variant_batches:
+            if hasattr(batch, 'mosfet_gt_vov'):
+                vov = batch.mosfet_gt_vov
+                valid = vov > 0
+                if valid.any():
+                    all_log_vov.extend(torch.log10(vov[valid].clamp(min=1e-15)).cpu().tolist())
+
+    if all_log_vov:
+        arr = np.array(all_log_vov)
+        vov_mean = float(arr.mean())
+        vov_std = float(arr.std())
+        if vov_std == 0:
+            vov_std = 1.0
+    else:
+        vov_mean, vov_std = 0.0, 1.0
+
+    return vov_mean, vov_std
+
+
+def normalize_batches_vov(batches: List, vov_mean: float, vov_std: float) -> None:
+    """Normalize Vov targets (log10 z-score) in batches in-place."""
+    for batch in batches:
+        if hasattr(batch, 'mosfet_gt_vov'):
+            valid = batch.mosfet_gt_vov > 0
+            batch.mosfet_vov_valid = valid
+            log_vov = torch.zeros_like(batch.mosfet_gt_vov)
+            log_vov[valid] = (torch.log10(batch.mosfet_gt_vov[valid].clamp(min=1e-15)) - vov_mean) / vov_std
+            batch.mosfet_gt_vov = log_vov
 
 
 def get_prediction_mask(batch):

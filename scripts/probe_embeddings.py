@@ -32,6 +32,7 @@ from src.training.data_loading import (
     add_ss_node_targets,
     compute_ss_normalization,
 )
+from src.gnn.architectures.tower_genconv import TowerGENConv
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +42,11 @@ from src.training.data_loading import (
 def extract_embeddings(model, batch, device):
     """Extract embeddings at multiple levels without modifying the model.
 
+    Supports both DeepGENConv and TowerGENConv architectures.
+
     Returns dict with:
         final_repr: [num_nodes, mlp_input_dim] — what heads see (with skip)
-        layer_outputs: list of [num_nodes, 128] per GEN layer
+        layer_outputs: list of [num_nodes, hidden_dim] per GNN layer
     """
     model.eval()
     with torch.no_grad():
@@ -51,30 +54,129 @@ def extract_embeddings(model, batch, device):
         x_in = model._get_input_features(batch)
         x = model.input_linear(x_in)
 
-        batch_idx = None
-        num_graphs = None
-        if model.virtual_node is not None:
-            batch_idx = batch.batch if hasattr(batch, 'batch') else torch.zeros(
-                x.size(0), dtype=torch.long, device=x.device
+        if isinstance(model, TowerGENConv):
+            # --- Tower architecture path ---
+            batch_vec = batch.batch if hasattr(batch, 'batch') else None
+            num_graphs = model._get_num_graphs(batch, batch_vec) if batch_vec is not None else 1
+            edge_attr = getattr(batch, 'edge_attr', None) if model.use_edge_features else None
+
+            vn_emb = None
+            if model.virtual_node is not None:
+                vn_emb = model.virtual_node.init_embedding(num_graphs)
+
+            # Backbone layers (with VN)
+            backbone_outputs, vn_emb = model._run_layers(
+                model.backbone, x, batch.edge_index, edge_attr,
+                batch=batch_vec, num_graphs=num_graphs,
+                use_vn=True, vn_emb=vn_emb,
             )
-            num_graphs = model._get_num_graphs(batch, batch_idx)
+            backbone_hidden = model.backbone_jk(backbone_outputs)
+            backbone_hidden = model.backbone[0].act(model.backbone[0].norm(backbone_hidden))
 
-        layer_outputs, _ = model._message_passing(
-            x, batch.edge_index, batch_idx, num_graphs
-        )
+            # State tower layers
+            state_outputs, _ = model._run_layers(
+                model.state_tower, backbone_hidden, batch.edge_index, edge_attr,
+            )
+            state_repr = model._finalize_repr(
+                model.state_jk, state_outputs, model.state_tower[0], x_in,
+            )
 
-        # Final representation (same as _get_final_representation)
-        backbone = model._apply_jk(layer_outputs)
-        backbone = model.layers[0].act(model.layers[0].norm(backbone))
-        if model.skip_connection:
-            final_repr = torch.cat([backbone, x_in], dim=-1)
+            # Sensitivity tower layers (if exists)
+            if model.has_sensitivity_tower:
+                sens_input = backbone_hidden
+                if model.state_conditioned_sens:
+                    state_hidden = model.state_jk(state_outputs)
+                    state_hidden = model.state_tower[0].act(model.state_tower[0].norm(state_hidden))
+                    state_for_sens = state_hidden.detach() if model.detach_state_for_sens else state_hidden
+                    sens_input = model.state_sens_proj(torch.cat([backbone_hidden, state_for_sens], dim=-1))
+
+                sens_outputs, _ = model._run_layers(
+                    model.sensitivity_tower, sens_input, batch.edge_index, edge_attr,
+                )
+                sens_repr = model._finalize_repr(
+                    model.sensitivity_jk, sens_outputs, model.sensitivity_tower[0], x_in,
+                )
+            else:
+                sens_outputs = []
+                sens_repr = None
+
+            # Y-branch: extract gm/gds branch representations if they exist
+            gm_repr = None
+            gds_repr = None
+            gm_branch_outputs = []
+            gds_branch_outputs = []
+            if model.has_sensitivity_tower and getattr(model, 'gm_branch', None) is not None:
+                branch_input = sens_outputs[-1]  # last hidden state from shared tower
+
+                gm_branch_outputs, _ = model._run_layers(
+                    model.gm_branch, branch_input, batch.edge_index, edge_attr,
+                )
+                gm_repr = model._finalize_repr(
+                    model.gm_branch_jk, gm_branch_outputs, model.gm_branch[0], x_in,
+                )
+
+                gds_branch_outputs, _ = model._run_layers(
+                    model.gds_branch, branch_input, batch.edge_index, edge_attr,
+                )
+                gds_repr = model._finalize_repr(
+                    model.gds_branch_jk, gds_branch_outputs, model.gds_branch[0], x_in,
+                )
+
+            # Backbone layer outputs (sequential, shared)
+            layer_outputs = list(backbone_outputs)
+            layer_labels = [f'BB{i}' for i in range(len(backbone_outputs))]
+
+            # State and sensitivity towers are PARALLEL from backbone — store separately
+            state_layer_outputs = state_outputs[1:]  # skip input (= backbone_hidden)
+            sens_layer_outputs = sens_outputs[1:] if sens_outputs else []
+
+            # Y-branch: store branch layer outputs separately (parallel from sensitivity)
+            gm_branch_layer_outputs = []
+            gds_branch_layer_outputs = []
+            if gm_branch_outputs:
+                gm_branch_layer_outputs = gm_branch_outputs[1:]   # skip input (= sens_outputs[-1])
+                gds_branch_layer_outputs = gds_branch_outputs[1:]
+
+            # final_repr = sensitivity tower output if available, else state tower output
+            # For Y-branch: gm_repr/gds_repr are what the heads actually see
+            final_repr = sens_repr if sens_repr is not None else state_repr
+
         else:
-            final_repr = backbone
+            # --- Original DeepGENConv path ---
+            batch_idx = None
+            num_graphs = None
+            if model.virtual_node is not None:
+                batch_idx = batch.batch if hasattr(batch, 'batch') else torch.zeros(
+                    x.size(0), dtype=torch.long, device=x.device
+                )
+                num_graphs = model._get_num_graphs(batch, batch_idx)
 
-    return {
+            layer_outputs, _ = model._message_passing(
+                x, batch.edge_index, batch_idx, num_graphs
+            )
+
+            backbone = model._apply_jk(layer_outputs)
+            backbone = model.layers[0].act(model.layers[0].norm(backbone))
+            if model.skip_connection:
+                final_repr = torch.cat([backbone, x_in], dim=-1)
+            else:
+                final_repr = backbone
+
+    result = {
         'final_repr': final_repr,       # [N, mlp_input_dim]
-        'layer_outputs': layer_outputs,  # list of [N, 128]
+        'layer_outputs': layer_outputs,  # list of [N, hidden_dim] — backbone only for tower
     }
+    if isinstance(model, TowerGENConv):
+        result['layer_labels'] = layer_labels
+        result['state_layers'] = state_layer_outputs      # parallel from backbone
+        result['sens_layers'] = sens_layer_outputs        # parallel from backbone
+        # Y-branch specific: branch representations (what gm/gds heads actually see)
+        if gm_repr is not None:
+            result['gm_final_repr'] = gm_repr
+            result['gds_final_repr'] = gds_repr
+            result['gm_branch_layers'] = gm_branch_layer_outputs
+            result['gds_branch_layers'] = gds_branch_layer_outputs
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +186,19 @@ def extract_embeddings(model, batch, device):
 def collect_drain_data(model, batches, device):
     """Collect drain embeddings + targets from all batches."""
     drain_final = []
-    drain_per_layer = None
+    drain_per_layer = None           # backbone layers
+    drain_state_layers = None        # state tower layers (parallel)
+    drain_sens_layers = None         # sensitivity tower layers (parallel)
+    drain_gm_repr = []               # Y-branch: gm branch output at drain
+    drain_gds_repr = []              # Y-branch: gds branch output at drain
+    drain_gm_branch_layers = None
+    drain_gds_branch_layers = None
     drain_gm = []
     drain_gds = []
     drain_is_nmos = []
     drain_region = []
     drain_device_id = []
+    layer_labels = None
 
     for batch in batches:
         batch = batch.to(device)
@@ -102,13 +211,41 @@ def collect_drain_data(model, batches, device):
 
         drain_final.append(emb['final_repr'][mask].cpu())
         drain_gm.append(batch.node_log_gm[mask].cpu())
+
+        # Capture layer labels (once)
+        if layer_labels is None and 'layer_labels' in emb:
+            layer_labels = emb['layer_labels']
+
+        # Y-branch: collect branch-specific drain embeddings
+        if 'gm_final_repr' in emb:
+            drain_gm_repr.append(emb['gm_final_repr'][mask].cpu())
+            drain_gds_repr.append(emb['gds_final_repr'][mask].cpu())
+
+            if drain_gm_branch_layers is None:
+                drain_gm_branch_layers = [[] for _ in emb['gm_branch_layers']]
+                drain_gds_branch_layers = [[] for _ in emb['gds_branch_layers']]
+            for i, lo in enumerate(emb['gm_branch_layers']):
+                drain_gm_branch_layers[i].append(lo[mask].cpu())
+            for i, lo in enumerate(emb['gds_branch_layers']):
+                drain_gds_branch_layers[i].append(lo[mask].cpu())
         drain_gds.append(batch.node_log_gds[mask].cpu())
 
-        # Per-layer drain embeddings
+        # Per-layer drain embeddings (backbone only)
         if drain_per_layer is None:
             drain_per_layer = [[] for _ in range(len(emb['layer_outputs']))]
         for i, lo in enumerate(emb['layer_outputs']):
             drain_per_layer[i].append(lo[mask].cpu())
+
+        # State/sensitivity tower layers (parallel branches, tower arch only)
+        if 'state_layers' in emb:
+            if drain_state_layers is None:
+                drain_state_layers = [[] for _ in emb['state_layers']]
+                drain_sens_layers = [[] for _ in emb['sens_layers']] if emb['sens_layers'] else None
+            for i, lo in enumerate(emb['state_layers']):
+                drain_state_layers[i].append(lo[mask].cpu())
+            if drain_sens_layers is not None:
+                for i, lo in enumerate(emb['sens_layers']):
+                    drain_sens_layers[i].append(lo[mask].cpu())
 
         # NMOS/PMOS and region — scatter from per-MOSFET to drain nodes
         mosfet_info = batch.mosfet_info
@@ -151,6 +288,20 @@ def collect_drain_data(model, batches, device):
     }
     if drain_per_layer is not None:
         result['per_layer'] = [torch.cat(l) for l in drain_per_layer]
+    if layer_labels is not None:
+        result['layer_labels'] = layer_labels
+    # Tower parallel branches: state and sensitivity tower layers
+    if drain_state_layers is not None:
+        result['state_layers'] = [torch.cat(l) for l in drain_state_layers]
+    if drain_sens_layers is not None:
+        result['sens_layers'] = [torch.cat(l) for l in drain_sens_layers]
+    # Y-branch: branch-specific drain embeddings
+    if drain_gm_repr:
+        result['gm_final'] = torch.cat(drain_gm_repr)
+        result['gds_final'] = torch.cat(drain_gds_repr)
+    if drain_gm_branch_layers is not None:
+        result['gm_branch_layers'] = [torch.cat(l) for l in drain_gm_branch_layers]
+        result['gds_branch_layers'] = [torch.cat(l) for l in drain_gds_branch_layers]
     return result
 
 
@@ -229,10 +380,14 @@ def run_linear_probe(train_data, val_data, output_dir):
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     results = {}
 
+    has_ybranch = 'gm_final' in train_data
+
     for col, target_name in enumerate(['gm', 'gds']):
-        X_train = train_data['final'].numpy()
+        # Y-branch: use branch-specific embeddings (what the heads actually see)
+        embed_key = f'{target_name}_final' if has_ybranch else 'final'
+        X_train = train_data[embed_key].numpy()
         y_train = train_data[target_name].numpy()
-        X_val = val_data['final'].numpy()
+        X_val = val_data[embed_key].numpy()
         y_val = val_data[target_name].numpy()
 
         probe = Ridge(alpha=1.0)
@@ -269,7 +424,8 @@ def run_linear_probe(train_data, val_data, output_dir):
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-    plt.suptitle('Linear Probe: Drain Embeddings → gm/gds', fontsize=14, fontweight='bold')
+    title = 'Linear Probe: Branch Embeddings → gm/gds (Y-branch)' if has_ybranch else 'Linear Probe: Drain Embeddings → gm/gds'
+    plt.suptitle(title, fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(output_dir / 'probe_linear.png', dpi=150, bbox_inches='tight')
     plt.close()
@@ -374,58 +530,174 @@ def run_tsne(val_data, output_dir, max_points=5000, has_ss=True):
 # Analysis 3: Layer-wise probing
 # ---------------------------------------------------------------------------
 
-def run_layerwise_probe(train_data, val_data, output_dir):
-    """Fit Ridge probe at each GEN layer to track when physics emerges."""
+def _probe_layers(layers_train, layers_val, y_train, y_val):
+    """Probe a list of layer embeddings, return list of R² values."""
     from sklearn.linear_model import Ridge
     from sklearn.metrics import r2_score
+    r2s = []
+    for i in range(len(layers_train)):
+        probe = Ridge(alpha=1.0)
+        probe.fit(layers_train[i].numpy(), y_train)
+        r2s.append(r2_score(y_val, probe.predict(layers_val[i].numpy())))
+    return r2s
 
+
+def run_layerwise_probe(train_data, val_data, output_dir):
+    """Fit Ridge probe at each GEN layer to track when physics emerges.
+
+    For tower models: backbone is shared, then state/sensitivity towers branch
+    in parallel. Plot reflects this parallel structure.
+    For Y-branch: sensitivity further splits into gm/gds branches.
+    """
     if 'per_layer' not in train_data or 'per_layer' not in val_data:
         print("  Skipping layer-wise probe (no per-layer data)")
         return None
 
-    num_layers = len(train_data['per_layer'])
-    results = {'layer': [], 'gm_r2': [], 'gds_r2': []}
+    has_tower = 'state_layers' in train_data
+    has_sens = 'sens_layers' in train_data
+    has_ybranch = 'gm_branch_layers' in train_data
+    layer_labels = train_data.get('layer_labels', [str(i) for i in range(len(train_data['per_layer']))])
 
-    for layer_idx in range(num_layers):
-        X_train = train_data['per_layer'][layer_idx].numpy()
-        X_val = val_data['per_layer'][layer_idx].numpy()
+    y_gm_tr = train_data['gm'].numpy()
+    y_gm_va = val_data['gm'].numpy()
+    y_gds_tr = train_data['gds'].numpy()
+    y_gds_va = val_data['gds'].numpy()
 
-        for target_name in ['gm', 'gds']:
-            y_train = train_data[target_name].numpy()
-            y_val = val_data[target_name].numpy()
+    # --- Backbone layers (always present) ---
+    bb_gm_r2 = _probe_layers(train_data['per_layer'], val_data['per_layer'], y_gm_tr, y_gm_va)
+    bb_gds_r2 = _probe_layers(train_data['per_layer'], val_data['per_layer'], y_gds_tr, y_gds_va)
+    n_bb = len(bb_gm_r2)
 
-            probe = Ridge(alpha=1.0)
-            probe.fit(X_train, y_train)
-            r2 = r2_score(y_val, probe.predict(X_val))
-            results[f'{target_name}_r2'].append(r2)
+    # --- State tower layers (parallel from backbone, tower only) ---
+    st_gm_r2, st_gds_r2 = [], []
+    if has_tower:
+        st_gm_r2 = _probe_layers(train_data['state_layers'], val_data['state_layers'], y_gm_tr, y_gm_va)
+        st_gds_r2 = _probe_layers(train_data['state_layers'], val_data['state_layers'], y_gds_tr, y_gds_va)
 
-        results['layer'].append(layer_idx)
+    # --- Sensitivity tower layers (parallel from backbone, tower only) ---
+    ss_gm_r2, ss_gds_r2 = [], []
+    if has_sens:
+        ss_gm_r2 = _probe_layers(train_data['sens_layers'], val_data['sens_layers'], y_gm_tr, y_gm_va)
+        ss_gds_r2 = _probe_layers(train_data['sens_layers'], val_data['sens_layers'], y_gds_tr, y_gds_va)
 
-    # Plot
-    fig, ax = plt.subplots(figsize=(10, 5))
-    layers = results['layer']
-    ax.plot(layers, results['gm_r2'], 'o-', color='#3498db', markersize=6, linewidth=2, label='gm R²')
-    ax.plot(layers, results['gds_r2'], 's-', color='#e74c3c', markersize=6, linewidth=2, label='gds R²')
+    # --- Y-branch layers (parallel from sensitivity) ---
+    gm_br_r2, gds_br_r2 = [], []
+    if has_ybranch:
+        gm_br_r2 = _probe_layers(train_data['gm_branch_layers'], val_data['gm_branch_layers'], y_gm_tr, y_gm_va)
+        gds_br_r2 = _probe_layers(train_data['gds_branch_layers'], val_data['gds_branch_layers'], y_gds_tr, y_gds_va)
 
-    ax.set_xlabel('Layer (0 = input projection, 1-15 = GEN layers)', fontsize=12)
-    ax.set_ylabel('Linear Probe R²', fontsize=12)
-    ax.set_title('Layer-wise Probing: When Does Physics Knowledge Emerge?', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=11)
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim([-0.05, 1.05])
-    ax.set_xticks(layers)
+    # --- Build results dict ---
+    results = {
+        'bb_labels': layer_labels, 'bb_gm_r2': bb_gm_r2, 'bb_gds_r2': bb_gds_r2,
+        'st_gm_r2': st_gm_r2, 'st_gds_r2': st_gds_r2,
+        'ss_gm_r2': ss_gm_r2, 'ss_gds_r2': ss_gds_r2,
+    }
+    if has_ybranch:
+        results['gm_branch_r2'] = gm_br_r2
+        results['gds_branch_r2'] = gds_br_r2
 
-    # Annotate peak
-    gm_peak = layers[np.argmax(results['gm_r2'])]
-    gds_peak = layers[np.argmax(results['gds_r2'])]
-    gm_best = max(results['gm_r2'])
-    gds_best = max(results['gds_r2'])
-    ax.annotate(f'gm peak: L{gm_peak} (R²={gm_best:.2f})',
-                xy=(gm_peak, gm_best), xytext=(gm_peak + 1, gm_best - 0.1),
-                arrowprops=dict(arrowstyle='->', color='#3498db'), fontsize=10, color='#3498db')
-    ax.annotate(f'gds peak: L{gds_peak} (R²={gds_best:.2f})',
-                xy=(gds_peak, gds_best), xytext=(gds_peak + 1, gds_best - 0.15),
-                arrowprops=dict(arrowstyle='->', color='#e74c3c'), fontsize=10, color='#e74c3c')
+    # --- Plot ---
+    if has_tower:
+        # Tower architecture: backbone on left, parallel towers on right
+        fig, (ax_bb, ax_towers) = plt.subplots(1, 2, figsize=(16, 6),
+                                                gridspec_kw={'width_ratios': [n_bb, max(len(st_gm_r2), len(ss_gm_r2)) + (len(gm_br_r2) if has_ybranch else 0) + 1]})
+
+        # Left panel: backbone
+        x_bb = list(range(n_bb))
+        ax_bb.plot(x_bb, bb_gm_r2, 'o-', color='#3498db', markersize=6, linewidth=2, label='gm R²')
+        ax_bb.plot(x_bb, bb_gds_r2, 's-', color='#e74c3c', markersize=6, linewidth=2, label='gds R²')
+        ax_bb.set_xticks(x_bb)
+        ax_bb.set_xticklabels(layer_labels, rotation=45, ha='right', fontsize=9)
+        ax_bb.set_xlabel('Backbone (shared)', fontsize=12)
+        ax_bb.set_ylabel('Linear Probe R²', fontsize=12)
+        ax_bb.set_title('Backbone Layers', fontsize=13, fontweight='bold')
+        ax_bb.legend(fontsize=10)
+        ax_bb.grid(True, alpha=0.3)
+        ax_bb.set_ylim([-0.05, 1.05])
+
+        # Right panel: parallel towers
+        # State tower
+        n_st = len(st_gm_r2)
+        n_ss = len(ss_gm_r2)
+        x_st = list(range(n_st))
+        st_labels = [f'ST{i}' for i in range(n_st)]
+        ax_towers.plot(x_st, st_gm_r2, 'o-', color='#3498db', markersize=8, linewidth=2, label='State → gm R²')
+        ax_towers.plot(x_st, st_gds_r2, 's-', color='#e74c3c', markersize=8, linewidth=2, label='State → gds R²')
+
+        # Sensitivity tower (offset on x-axis to show parallel)
+        if n_ss > 0:
+            x_ss = [i + n_st + 1 for i in range(n_ss)]  # gap of 1 to separate
+            ss_labels = [f'SS{i}' for i in range(n_ss)]
+            ax_towers.plot(x_ss, ss_gm_r2, '^', color='#3498db', markersize=8, linewidth=2, linestyle='--', label='Sens → gm R²')
+            ax_towers.plot(x_ss, ss_gds_r2, 'D', color='#e74c3c', markersize=8, linewidth=2, linestyle='--', label='Sens → gds R²')
+        else:
+            x_ss = []
+            ss_labels = []
+
+        # Y-branch (offset further)
+        br_labels = []
+        if has_ybranch and (gm_br_r2 or gds_br_r2):
+            x_br_start = (x_ss[-1] if x_ss else x_st[-1]) + 2
+            n_br = max(len(gm_br_r2), len(gds_br_r2))
+            x_br = [x_br_start + i for i in range(n_br)]
+            br_labels = [f'BR{i}' for i in range(n_br)]
+            if gm_br_r2:
+                ax_towers.plot(x_br[:len(gm_br_r2)], gm_br_r2, 'v', color='#3498db', markersize=8, linewidth=2, linestyle=':', label='gm branch → gm R²')
+            if gds_br_r2:
+                ax_towers.plot(x_br[:len(gds_br_r2)], gds_br_r2, 'P', color='#e74c3c', markersize=8, linewidth=2, linestyle=':', label='gds branch → gds R²')
+
+        # Separator between tower groups
+        if x_ss:
+            sep1 = (x_st[-1] + x_ss[0]) / 2
+            ax_towers.axvline(sep1, color='gray', linestyle=':', alpha=0.5)
+        if has_ybranch and br_labels:
+            sep2 = (x_ss[-1] + x_br[0]) / 2 if x_ss else (x_st[-1] + x_br[0]) / 2
+            ax_towers.axvline(sep2, color='gray', linestyle=':', alpha=0.5)
+
+        # Backbone final R² as baseline
+        ax_towers.axhline(bb_gm_r2[-1], color='#3498db', linestyle='-.', alpha=0.3, linewidth=1)
+        ax_towers.axhline(bb_gds_r2[-1], color='#e74c3c', linestyle='-.', alpha=0.3, linewidth=1)
+
+        all_x = x_st + x_ss + (x_br if has_ybranch and br_labels else [])
+        all_labels = st_labels + ss_labels + br_labels
+        ax_towers.set_xticks(all_x)
+        ax_towers.set_xticklabels(all_labels, rotation=45, ha='right', fontsize=10)
+        ax_towers.set_xlabel('Tower Layers (State ‖ Sensitivity' + (' ‖ Branches)' if has_ybranch else ')'), fontsize=12)
+        ax_towers.set_ylabel('Linear Probe R²', fontsize=12)
+        ax_towers.set_title('Parallel Tower Layers', fontsize=13, fontweight='bold')
+        ax_towers.legend(fontsize=8, ncol=2)
+        ax_towers.grid(True, alpha=0.3)
+        ax_towers.set_ylim([-0.05, 1.05])
+
+    else:
+        # DeepGENConv: single sequential plot
+        fig, ax_bb = plt.subplots(figsize=(10, 5))
+        x_bb = list(range(n_bb))
+        ax_bb.plot(x_bb, bb_gm_r2, 'o-', color='#3498db', markersize=6, linewidth=2, label='gm R²')
+        ax_bb.plot(x_bb, bb_gds_r2, 's-', color='#e74c3c', markersize=6, linewidth=2, label='gds R²')
+        ax_bb.set_xlabel('Layer (0 = input projection)', fontsize=12)
+        ax_bb.set_ylabel('Linear Probe R²', fontsize=12)
+        ax_bb.set_title('Layer-wise Probing: When Does Physics Knowledge Emerge?', fontsize=13, fontweight='bold')
+        ax_bb.legend(fontsize=11)
+        ax_bb.grid(True, alpha=0.3)
+        ax_bb.set_ylim([-0.05, 1.05])
+        ax_bb.set_xticks(x_bb)
+        if layer_labels:
+            ax_bb.set_xticklabels(layer_labels, rotation=45, ha='right', fontsize=9)
+
+    # Annotate peaks
+    all_gm = bb_gm_r2 + st_gm_r2 + ss_gm_r2 + (gm_br_r2 if has_ybranch else [])
+    all_gds = bb_gds_r2 + st_gds_r2 + ss_gds_r2 + (gds_br_r2 if has_ybranch else [])
+    all_names = list(layer_labels) + [f'ST{i}' for i in range(len(st_gm_r2))] + [f'SS{i}' for i in range(len(ss_gm_r2))]
+    if has_ybranch:
+        all_names += [f'BR{i}' for i in range(max(len(gm_br_r2), len(gds_br_r2)))]
+
+    gm_peak_name = all_names[np.argmax(all_gm)]
+    gds_peak_name = all_names[np.argmax(all_gds)]
+    results['gm_peak'] = gm_peak_name
+    results['gds_peak'] = gds_peak_name
+    results['gm_best'] = max(all_gm)
+    results['gds_best'] = max(all_gds)
 
     plt.tight_layout()
     plt.savefig(output_dir / 'probe_layerwise.png', dpi=150, bbox_inches='tight')
@@ -879,10 +1151,26 @@ def main():
         print("\n--- Analysis 3: Layer-wise Probing ---")
         layer_results = run_layerwise_probe(train_data, val_data, output_dir)
         if layer_results:
-            gm_best_layer = layer_results['layer'][np.argmax(layer_results['gm_r2'])]
-            gds_best_layer = layer_results['layer'][np.argmax(layer_results['gds_r2'])]
-            print(f"  gm:  best at layer {gm_best_layer} (R²={max(layer_results['gm_r2']):.3f})")
-            print(f"  gds: best at layer {gds_best_layer} (R²={max(layer_results['gds_r2']):.3f})")
+            print(f"  Overall peak — gm: {layer_results['gm_peak']} (R²={layer_results['gm_best']:.3f}), gds: {layer_results['gds_peak']} (R²={layer_results['gds_best']:.3f})")
+            # Print per-section summaries
+            bb_labels = layer_results['bb_labels']
+            for section, gm_r2s, gds_r2s, labels in [
+                ('Backbone', layer_results['bb_gm_r2'], layer_results['bb_gds_r2'], bb_labels),
+                ('State tower', layer_results['st_gm_r2'], layer_results['st_gds_r2'], [f'ST{i}' for i in range(len(layer_results['st_gm_r2']))]),
+                ('Sensitivity tower', layer_results['ss_gm_r2'], layer_results['ss_gds_r2'], [f'SS{i}' for i in range(len(layer_results['ss_gm_r2']))]),
+            ]:
+                if gm_r2s:
+                    best_gm_i = np.argmax(gm_r2s)
+                    best_gds_i = np.argmax(gds_r2s)
+                    print(f"  {section}: gm best={labels[best_gm_i]} R²={gm_r2s[best_gm_i]:.3f}, gds best={labels[best_gds_i]} R²={gds_r2s[best_gds_i]:.3f}")
+            if 'gm_branch_r2' in layer_results:
+                print(f"  --- Y-branch layers (parallel from sensitivity) ---")
+                for i in range(max(len(layer_results['gm_branch_r2']), len(layer_results['gds_branch_r2']))):
+                    gm_r2 = layer_results['gm_branch_r2'][i] if i < len(layer_results['gm_branch_r2']) else None
+                    gds_r2 = layer_results['gds_branch_r2'][i] if i < len(layer_results['gds_branch_r2']) else None
+                    gm_str = f"gm R²={gm_r2:.3f}" if gm_r2 is not None else ""
+                    gds_str = f"gds R²={gds_r2:.3f}" if gds_r2 is not None else ""
+                    print(f"  BR{i}: {gm_str}  {gds_str}")
     else:
         print("\n--- Skipping Layer-wise Probing (SS head disabled) ---")
 

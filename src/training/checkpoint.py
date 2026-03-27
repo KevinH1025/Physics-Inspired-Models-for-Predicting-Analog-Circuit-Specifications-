@@ -29,6 +29,10 @@ def create_model(
     use_virtual_node=False,
     use_attention_pooling=True,
     vn_learn_temperature=False,
+    vn_gate_broadcast=False,
+    vn_mode='default',
+    vn_num_heads=4,
+    vn_head_dim=32,
     gradient_checkpointing=False,
     device='cuda',
     model_type=None,
@@ -57,6 +61,10 @@ def create_model(
     backbone_jk_config=None,
     state_tower_jk_config=None,
     sensitivity_tower_jk_config=None,
+    vov_head_config=None,
+    vth_head_config=None,
+    loop_attention_config=None,
+    dc_gain_config=None,
 ):
     """
     Create a GNN model with the specified configuration.
@@ -120,6 +128,10 @@ def create_model(
         use_virtual_node=use_virtual_node,
         use_attention_pooling=use_attention_pooling,
         vn_learn_temperature=vn_learn_temperature,
+        vn_gate_broadcast=vn_gate_broadcast,
+        vn_mode=vn_mode,
+        vn_num_heads=vn_num_heads,
+        vn_head_dim=vn_head_dim,
         gradient_checkpointing=gradient_checkpointing,
         # Voltage-derived current options
         derive_currents_from_voltage=derive_currents_from_voltage,
@@ -158,6 +170,14 @@ def create_model(
         backbone_jk_config=backbone_jk_config or {},
         state_tower_jk_config=state_tower_jk_config or {},
         sensitivity_tower_jk_config=sensitivity_tower_jk_config or {},
+        # Vov prediction head
+        vov_head_config=vov_head_config or {},
+        # Vth prediction head
+        vth_head_config=vth_head_config or {},
+        # Loop attention config
+        loop_attention_config=loop_attention_config or {},
+        # DC gain prediction head
+        dc_gain_config=dc_gain_config or {},
     )
 
     # Create model using registry
@@ -202,6 +222,10 @@ def create_model_from_args(args, input_dim, device='cuda'):
         use_virtual_node=args.virtual_node,
         use_attention_pooling=getattr(args, 'use_attention_pooling', True),
         vn_learn_temperature=getattr(args, 'vn_learn_temperature', False),
+        vn_gate_broadcast=getattr(args, 'vn_gate_broadcast', False),
+        vn_mode=getattr(args, 'vn_mode', 'default'),
+        vn_num_heads=getattr(args, 'vn_num_heads', 4),
+        vn_head_dim=getattr(args, 'vn_head_dim', 32),
         gradient_checkpointing=getattr(args, 'gradient_checkpointing', False),
         device=device,
         model_type=model_type,
@@ -229,6 +253,10 @@ def create_model_from_args(args, input_dim, device='cuda'):
         backbone_jk_config=getattr(args, 'backbone_jk_config', {}),
         state_tower_jk_config=getattr(args, 'state_tower_jk_config', {}),
         sensitivity_tower_jk_config=getattr(args, 'sensitivity_tower_jk_config', {}),
+        vov_head_config=getattr(args, 'vov_head_config', {}),
+        vth_head_config=getattr(args, 'vth_head_config', {}),
+        loop_attention_config=getattr(args, 'loop_attention_config', {}),
+        dc_gain_config=getattr(args, 'dc_gain_config', {}),
     )
 
 
@@ -391,6 +419,8 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         ac_head_config=config.get('ac_head_config', {}),
         ss_head_config=config.get('ss_head_config', {}),
         region_head_config=config.get('region_head_config', {}),
+        use_device_pooling_current=config.get('use_device_pooling_current',
+            any('device_current_head.' in k for k in state_dict.keys())),
         device_aggregation_config=config.get('device_aggregation_config',
             {'enabled': True} if any('device_agg.' in k for k in state_dict.keys()) else {}),
         backbone_layers=config.get('backbone_layers', 6),
@@ -399,6 +429,9 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         backbone_jk_config=config.get('backbone_jk_config', {}),
         state_tower_jk_config=config.get('state_tower_jk_config', {}),
         sensitivity_tower_jk_config=config.get('sensitivity_tower_jk_config', {}),
+        vov_head_config=config.get('vov_head_config', {}),
+        vth_head_config=config.get('vth_head_config', {}),
+        dc_gain_config=config.get('dc_gain_config', {}),
     )
 
     # Load weights and move to device
@@ -500,6 +533,8 @@ def build_full_config(args, total_input_dim, predict_currents, voltage_head_conf
         'backbone_jk_config': getattr(args, 'backbone_jk_config', {}),
         'state_tower_jk_config': getattr(args, 'state_tower_jk_config', {}),
         'sensitivity_tower_jk_config': getattr(args, 'sensitivity_tower_jk_config', {}),
+        # DC gain prediction head config
+        'dc_gain_config': getattr(args, 'dc_gain_config', {}),
         # Training params
         'learning_rate': args.lr,
         'weight_decay': getattr(args, 'weight_decay', 0.0),
