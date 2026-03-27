@@ -10,6 +10,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+import networkx as nx
 import numpy as np
 import torch
 from torch_geometric.data import Data
@@ -403,6 +404,9 @@ class CircuitGraphBuilder:
         vsource_info = self._create_vsource_info(terminals, net_to_idx)
         isource_info = self._create_isource_info(terminals, net_to_idx, i_ref)
 
+        # Build loop info for loop attention
+        loop_edge_index, device_terminal_map = self._create_loop_info(terminals, net_to_terminals)
+
         # Create physics constraint tensors (lazy import to avoid circular dependency)
         from src.training.current_constraints import create_constraint_tensors
         diff_pair_constraints, mirror_constraints, output_stage_constraints, lambda_mirror_constraints = create_constraint_tensors(
@@ -437,7 +441,10 @@ class CircuitGraphBuilder:
             lambda_mirror_constraints=lambda_mirror_constraints,
             terminal_train_mask=terminal_train_mask,
             terminal_vdc=terminal_vdc,
+            loop_edge_index=loop_edge_index,
+            device_terminal_map=device_terminal_map,
         )
+        data.num_devices = device_terminal_map.shape[0]
 
         data.num_terminals = len(terminals)
         data.num_nets = len(nets)
@@ -450,10 +457,12 @@ class CircuitGraphBuilder:
             data.ac_pm = torch.tensor([ac_metrics.get('pm') or 0.0], dtype=torch.float)
             data.ac_am = torch.tensor([ac_metrics.get('am') or 0.0], dtype=torch.float)
             data.ac_dc_gain = torch.tensor([ac_metrics.get('dc_gain') or 0.0], dtype=torch.float)
-            # Track which metrics are valid (some circuits may not have stable loop gain)
+            # Track which metrics are valid (requires positive DC gain for meaningful UGBW/PM)
+            dc_gain = ac_metrics.get('dc_gain')
             data.ac_valid = torch.tensor([
                 ac_metrics.get('ugbw') is not None and
-                ac_metrics.get('pm') is not None
+                ac_metrics.get('pm') is not None and
+                dc_gain is not None and dc_gain > 0
             ], dtype=torch.bool)
 
         # Small-signal parameters per MOSFET (ordered same as mosfet_info)
@@ -658,6 +667,79 @@ class CircuitGraphBuilder:
             return torch.tensor(mosfet_info, dtype=torch.long), device_names
         else:
             return torch.zeros((0, 7), dtype=torch.long), []
+
+    def _create_loop_info(
+        self,
+        terminals: List,
+        net_to_terminals: Dict[str, List[int]],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Detect circuit loops via NetworkX and build loop edge index + device terminal map.
+
+        Returns:
+            loop_edge_index: [2, E_loop] device-level edges connecting devices in same loop
+            device_terminal_map: [D, 4] terminal node indices per device (-1 padded)
+        """
+        # Build device → terminal indices mapping
+        device_terms = {}  # dev_name -> list of terminal node indices
+        device_nets = {}   # dev_name -> set of net names
+        for i, term in enumerate(terminals):
+            dev = term.device_name
+            if dev not in device_terms:
+                device_terms[dev] = []
+                device_nets[dev] = set()
+            device_terms[dev].append(i)
+            device_nets[dev].add(term.net)
+
+        device_names = list(device_terms.keys())
+        dev_to_idx = {name: i for i, name in enumerate(device_names)}
+        num_devices = len(device_names)
+
+        # Build device-level graph: edge if two devices share a net
+        G = nx.Graph()
+        G.add_nodes_from(range(num_devices))
+
+        # net → list of device indices
+        net_to_devices = defaultdict(set)
+        for dev_name, nets in device_nets.items():
+            for net in nets:
+                net_to_devices[net].add(dev_to_idx[dev_name])
+
+        for net, devs in net_to_devices.items():
+            devs = list(devs)
+            for i in range(len(devs)):
+                for j in range(i + 1, len(devs)):
+                    G.add_edge(devs[i], devs[j])
+
+        # Find fundamental cycles
+        cycles = nx.cycle_basis(G)
+
+        # Build loop_edge_index: connect all device pairs within each cycle
+        loop_edges = set()
+        for cycle in cycles:
+            for i in range(len(cycle)):
+                for j in range(i + 1, len(cycle)):
+                    a, b = min(cycle[i], cycle[j]), max(cycle[i], cycle[j])
+                    loop_edges.add((a, b))
+
+        # Make bidirectional
+        if loop_edges:
+            src, dst = [], []
+            for a, b in loop_edges:
+                src.extend([a, b])
+                dst.extend([b, a])
+            loop_edge_index = torch.tensor([src, dst], dtype=torch.long)
+        else:
+            loop_edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+        # Build device_terminal_map: [D, 4] padded with -1
+        max_terms = 4
+        device_terminal_map = torch.full((num_devices, max_terms), -1, dtype=torch.long)
+        for dev_name, term_indices in device_terms.items():
+            d = dev_to_idx[dev_name]
+            for t, idx in enumerate(term_indices[:max_terms]):
+                device_terminal_map[d, t] = idx
+
+        return loop_edge_index, device_terminal_map
 
     def _create_mosfet_region_labels(
         self,

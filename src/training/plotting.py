@@ -34,6 +34,8 @@ def plot_training_curves(
     val_kcl_losses: List[float] = None,
     train_ac_losses: List[float] = None,
     val_ac_losses: List[float] = None,
+    train_ac_component_losses: Dict[str, List[float]] = None,
+    val_ac_component_losses: Dict[str, List[float]] = None,
     train_region_losses: List[float] = None,
     val_region_losses: List[float] = None,
     train_gm_physics_losses: List[float] = None,
@@ -42,6 +44,10 @@ def plot_training_curves(
     val_triode_physics_losses: List[float] = None,
     train_cutoff_physics_losses: List[float] = None,
     val_cutoff_physics_losses: List[float] = None,
+    train_dc_gain_losses: List[float] = None,
+    val_dc_gain_losses: List[float] = None,
+    max_grad_norms: List[float] = None,
+    avg_grad_norms: List[float] = None,
     num_train_batches: int = 0,
     num_val_batches: int = 0,
 ) -> None:
@@ -50,17 +56,21 @@ def plot_training_curves(
 
     # Determine grid size based on what losses are active
     has_region = train_region_losses and any(v > 0 for v in train_region_losses)
-    has_kcl_ac = (train_ac_losses and any(v > 0 for v in train_ac_losses)) or \
-                 (train_kcl_losses and any(v > 0 for v in train_kcl_losses)) or has_region
+    has_ac = train_ac_losses and any(v > 0 for v in train_ac_losses)
+    has_kcl = train_kcl_losses and any(v > 0 for v in train_kcl_losses)
+    # Count AC component plots (3 separate if per-component available, else 1)
+    n_ac_plots = len(train_ac_component_losses) if (has_ac and train_ac_component_losses) else (1 if has_ac else 0)
+    n_kcl_ac_plots = (1 if has_kcl else 0) + n_ac_plots + (1 if has_region else 0)
+    has_dc_gain = train_dc_gain_losses and any(v > 0 for v in train_dc_gain_losses)
+    n_kcl_ac_plots += (1 if has_dc_gain else 0)
+    has_kcl_ac = n_kcl_ac_plots > 0
+    # Need extra row if KCL+AC plots exceed 4 columns
+    kcl_ac_rows = max(1, (n_kcl_ac_plots + 3) // 4) if has_kcl_ac else 0
     has_physics = (train_gm_physics_losses and any(v > 0 for v in train_gm_physics_losses)) or \
                   (train_triode_physics_losses and any(v > 0 for v in train_triode_physics_losses)) or \
                   (train_cutoff_physics_losses and any(v > 0 for v in train_cutoff_physics_losses))
-    if has_kcl_ac and has_physics:
-        nrows = 4
-    elif has_kcl_ac or has_physics:
-        nrows = 3
-    else:
-        nrows = 2
+    has_grad_norms = max_grad_norms and len(max_grad_norms) > 0
+    nrows = 2 + kcl_ac_rows + (1 if has_physics else 0) + (1 if has_grad_norms else 0)
     fig, axes = plt.subplots(nrows, 4, figsize=(16, 4 * nrows))
     fig.suptitle(f'Training Curves - {num_train_batches} train, {num_val_batches} val, {num_epochs} epochs', fontsize=12)
 
@@ -154,12 +164,23 @@ def plot_training_curves(
     else:
         axes[1, 3].axis('off')
 
-    # Row 3: KCL Loss, AC Loss, Region Loss (if present)
+    # Row 3+: KCL Loss, AC component losses, Region Loss (if present)
     if has_kcl_ac:
         kcl_ac_row = 2
         col = 0
-        if train_kcl_losses and any(v > 0 for v in train_kcl_losses):
+
+        def _next_ax():
+            nonlocal kcl_ac_row, col
             ax = axes[kcl_ac_row, col]
+            col += 1
+            if col >= 4:
+                # Fill remaining cols in current row
+                col = 0
+                kcl_ac_row += 1
+            return ax
+
+        if has_kcl:
+            ax = _next_ax()
             ax.semilogy(train_epochs, train_kcl_losses, 'b-', label='Train', alpha=0.7)
             if val_kcl_losses:
                 ax.semilogy(val_epochs, val_kcl_losses, 'r-', label='Val', alpha=0.7)
@@ -168,22 +189,36 @@ def plot_training_curves(
             ax.set_title('KCL Loss')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            col += 1
 
-        if train_ac_losses and any(v > 0 for v in train_ac_losses):
-            ax = axes[kcl_ac_row, col]
-            ax.semilogy(train_epochs, train_ac_losses, 'b-', label='Train', alpha=0.7)
-            if val_ac_losses:
-                ax.semilogy(val_epochs, val_ac_losses, 'r-', label='Val', alpha=0.7)
-            ax.set_xlabel('Epoch')
-            ax.set_ylabel('AC Loss (MSE)')
-            ax.set_title('AC Loss')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            col += 1
+        if has_ac:
+            # Plot per-component AC losses if available, otherwise combined
+            if train_ac_component_losses and len(train_ac_component_losses) > 0:
+                comp_names = {'ugbw': 'UGBW', 'pm': 'PM', 'am': 'AM'}
+                for comp in train_ac_component_losses:
+                    ax = _next_ax()
+                    tr_data = train_ac_component_losses[comp]
+                    ax.semilogy(train_epochs[:len(tr_data)], tr_data, 'b-', label='Train', alpha=0.7)
+                    if val_ac_component_losses and comp in val_ac_component_losses:
+                        vl_data = val_ac_component_losses[comp]
+                        ax.semilogy(val_epochs[:len(vl_data)], vl_data, 'r-', label='Val', alpha=0.7)
+                    ax.set_xlabel('Epoch')
+                    ax.set_ylabel(f'{comp_names.get(comp, comp)} Loss')
+                    ax.set_title(f'AC {comp_names.get(comp, comp)} Loss')
+                    ax.legend()
+                    ax.grid(True, alpha=0.3)
+            else:
+                ax = _next_ax()
+                ax.semilogy(train_epochs, train_ac_losses, 'b-', label='Train', alpha=0.7)
+                if val_ac_losses:
+                    ax.semilogy(val_epochs, val_ac_losses, 'r-', label='Val', alpha=0.7)
+                ax.set_xlabel('Epoch')
+                ax.set_ylabel('AC Loss (MSE)')
+                ax.set_title('AC Loss')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
 
         if has_region:
-            ax = axes[kcl_ac_row, col]
+            ax = _next_ax()
             ax.plot(train_epochs, train_region_losses, 'b-', label='Train', alpha=0.7)
             if val_region_losses:
                 ax.plot(val_epochs, val_region_losses, 'r-', label='Val', alpha=0.7)
@@ -192,14 +227,27 @@ def plot_training_curves(
             ax.set_title('Region Classification Loss')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            col += 1
 
-        for c in range(col, 4):
-            axes[kcl_ac_row, c].axis('off')
+        if has_dc_gain:
+            ax = _next_ax()
+            ax.semilogy(train_epochs, train_dc_gain_losses, 'b-', label='Train', alpha=0.7)
+            if val_dc_gain_losses:
+                ax.semilogy(val_epochs, val_dc_gain_losses, 'r-', label='Val', alpha=0.7)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('DC Gain Loss (MSE)')
+            ax.set_title('DC Gain Loss')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        # Turn off unused axes in kcl/ac rows
+        for r in range(2, 2 + kcl_ac_rows):
+            start_col = col if r == kcl_ac_row else 0
+            for c in range(start_col, 4):
+                axes[r, c].axis('off')
 
     # Physics losses row: gm_sat, triode, cutoff
     if has_physics:
-        phy_row = 3 if has_kcl_ac else 2
+        phy_row = 2 + kcl_ac_rows
         col = 0
 
         if train_gm_physics_losses and any(v > 0 for v in train_gm_physics_losses):
@@ -240,6 +288,22 @@ def plot_training_curves(
 
         for c in range(col, 4):
             axes[phy_row, c].axis('off')
+
+    # Gradient norm row
+    if has_grad_norms:
+        grad_row = 2 + kcl_ac_rows + (1 if has_physics else 0)
+        ax = axes[grad_row, 0]
+        ax.semilogy(train_epochs, max_grad_norms, 'r-', label='Max', alpha=0.7)
+        ax.semilogy(train_epochs, avg_grad_norms, 'b-', label='Avg', alpha=0.7)
+        ax.axhline(y=1.0, color='k', linestyle='--', alpha=0.3, label='Clip=1.0')
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Gradient Norm')
+        ax.set_title('Gradient Norms (before clip)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        for c in range(1, 4):
+            axes[grad_row, c].axis('off')
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')

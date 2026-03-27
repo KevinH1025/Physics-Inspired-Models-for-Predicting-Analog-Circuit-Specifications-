@@ -8,6 +8,7 @@ To add a new loss type:
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from .current_constraints import compute_current_constraint_loss
@@ -778,7 +779,8 @@ def compute_gm_physics_loss(
         return torch.tensor(0.0, device=device)
 
     # gm from SS head (denormalize to real value)
-    log10_gm_pred = ss_gm_pred[drain_term_idx[valid_mask]] * ss_gm_std + ss_gm_mean
+    # ss_gm_pred is per-MOSFET (from concat head), not per-node
+    log10_gm_pred = ss_gm_pred[valid_mask] * ss_gm_std + ss_gm_mean
 
     # I_D from current head (denormalize to real amps)
     Id_real = torch.pow(10, pred_currents[drain_term_idx[valid_mask]] * current_std + current_mean).clamp(min=1e-12)
@@ -817,11 +819,11 @@ def compute_gm_physics_loss(
         # Compared in log10 space: log10(LHS) vs log10(RHS)
         gm_real = torch.pow(10, log10_gm_pred).clamp(min=1e-15)
 
-        # gds from SS head — apply vov_mask only when predicted Vov filter was used
+        # gds from SS head (per-MOSFET) — apply vov_mask only when predicted Vov filter was used
         if not has_gt_vov_filter:
-            log10_gds_pred = ss_gds_pred[drain_term_idx[valid_mask]][vov_mask] * ss_gds_std + ss_gds_mean
+            log10_gds_pred = ss_gds_pred[valid_mask][vov_mask] * ss_gds_std + ss_gds_mean
         else:
-            log10_gds_pred = ss_gds_pred[drain_term_idx[valid_mask]] * ss_gds_std + ss_gds_mean
+            log10_gds_pred = ss_gds_pred[valid_mask] * ss_gds_std + ss_gds_mean
         gds_real = torch.pow(10, log10_gds_pred).clamp(min=1e-15)
 
         # Vds: use GT voltages when available, else predicted
@@ -902,8 +904,8 @@ def compute_cutoff_physics_loss(
     if not cutoff_mask.any():
         return torch.tensor(0.0, device=device)
 
-    # gm from SS head (denormalize to log10 scale)
-    log10_gm_pred = ss_gm_pred[drain_term_idx[cutoff_mask]] * ss_gm_std + ss_gm_mean
+    # gm from SS head (per-MOSFET, denormalize to log10 scale)
+    log10_gm_pred = ss_gm_pred[cutoff_mask] * ss_gm_std + ss_gm_mean
 
     # Id from current head (denormalize to real amps)
     Id_real = torch.pow(10, pred_currents[drain_term_idx[cutoff_mask]] * current_std + current_mean).clamp(min=1e-15)
@@ -1056,11 +1058,11 @@ def compute_triode_physics_loss(
     Vds_f = Vds[vov_mask].clamp(min=1e-6)
     drain_term_f = drain_term_idx[valid_mask][vov_mask]
 
-    # Denormalize gm/gds predictions (log10 scale)
-    log10_gm_pred_f = ss_gm_pred[drain_term_f] * ss_gm_std + ss_gm_mean
-    log10_gds_pred_f = ss_gds_pred[drain_term_f] * ss_gds_std + ss_gds_mean
+    # Denormalize gm/gds predictions (per-MOSFET, log10 scale)
+    log10_gm_pred_f = ss_gm_pred[valid_mask][vov_mask] * ss_gm_std + ss_gm_mean
+    log10_gds_pred_f = ss_gds_pred[valid_mask][vov_mask] * ss_gds_std + ss_gds_mean
 
-    # Denormalize current (real amps)
+    # Denormalize current (real amps, still per-node)
     if needs_current:
         Id_real_f = torch.pow(10, pred_currents[drain_term_f] * current_std + current_mean).clamp(min=1e-12)
 
@@ -1100,6 +1102,26 @@ def compute_triode_physics_loss(
     return combined, eq1_loss, eq2_loss, eq3_loss
 
 
+def compute_vov_loss(vov_pred: torch.Tensor, mosfet_gt_vov: torch.Tensor,
+                     mosfet_vov_valid: torch.Tensor = None) -> torch.Tensor:
+    """MSE loss on predicted vs GT Vov, skipping cutoff devices."""
+    if mosfet_vov_valid is not None:
+        mask = mosfet_vov_valid
+    else:
+        mask = (mosfet_gt_vov > 0) & (mosfet_gt_vov < 1.8)
+    if mask.sum() == 0:
+        return torch.tensor(0.0, device=vov_pred.device)
+    return F.mse_loss(vov_pred[mask], mosfet_gt_vov[mask])
+
+
+def compute_vth_loss(vth_pred: torch.Tensor, mosfet_vth: torch.Tensor) -> torch.Tensor:
+    """MSE loss on predicted vs GT Vth, skipping missing values."""
+    valid = mosfet_vth.abs() > 1e-6
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=vth_pred.device)
+    return F.mse_loss(vth_pred[valid], mosfet_vth[valid])
+
+
 # Supervised gm/gds Prediction Loss (mask-based, like voltage/current)
 def compute_ss_loss(
     gm_pred: torch.Tensor,
@@ -1110,6 +1132,9 @@ def compute_ss_loss(
     gm_std: float,
     gds_mean: float,
     gds_std: float,
+    huber_delta: float = 0.0,
+    region_stats: dict = None,
+    mosfet_region_labels: torch.Tensor = None,
 ) -> tuple:
     """
     Supervised loss for per-MOSFET gm/gds predictions.
@@ -1117,13 +1142,17 @@ def compute_ss_loss(
     Predictions are per-MOSFET (from gate+drain+source terminal concat).
     Targets are raw linear-scale mosfet_gm/mosfet_gds, normalized inline.
 
+    If region_stats is provided, uses per-region (mean, std) for target normalization.
+
     Args:
         gm_pred: [num_mosfets] predicted z-scored log10(gm)
         gds_pred: [num_mosfets] predicted z-scored log10(gds)
         mosfet_gm: [num_mosfets] raw gm values (linear scale)
         mosfet_gds: [num_mosfets] raw gds values (linear scale)
-        gm_mean/gm_std: z-score normalization stats for log10(gm)
-        gds_mean/gds_std: z-score normalization stats for log10(gds)
+        gm_mean/gm_std: global z-score normalization stats for log10(gm)
+        gds_mean/gds_std: global z-score normalization stats for log10(gds)
+        region_stats: Optional per-region stats dict {0: {'gm_mean', 'gm_std', ...}, ...}
+        mosfet_region_labels: Optional [num_mosfets] region labels (0=cutoff, 1=triode, 2=sat)
 
     Returns:
         Tuple of (gm_loss, gds_loss) scalar tensors
@@ -1134,15 +1163,93 @@ def compute_ss_loss(
     valid = mosfet_gm > 1e-12
 
     if valid.any():
-        gm_target = (torch.log10(mosfet_gm[valid]) - gm_mean) / gm_std
-        gds_target = (torch.log10(mosfet_gds[valid].clamp(min=1e-20)) - gds_mean) / gds_std
-        gm_loss = F.mse_loss(gm_pred[valid], gm_target)
-        gds_loss = F.mse_loss(gds_pred[valid], gds_target)
+        log_gm = torch.log10(mosfet_gm[valid])
+        log_gds = torch.log10(mosfet_gds[valid].clamp(min=1e-20))
+
+        if region_stats is not None and mosfet_region_labels is not None:
+            labels = mosfet_region_labels.to(device)[valid]
+            gm_means = torch.full_like(log_gm, gm_mean)
+            gm_stds = torch.full_like(log_gm, gm_std)
+            gds_means = torch.full_like(log_gds, gds_mean)
+            gds_stds = torch.full_like(log_gds, gds_std)
+            for r in range(3):
+                rmask = (labels == r)
+                if rmask.any():
+                    gm_means[rmask] = region_stats[r]['gm_mean']
+                    gm_stds[rmask] = region_stats[r]['gm_std']
+                    gds_means[rmask] = region_stats[r]['gds_mean']
+                    gds_stds[rmask] = region_stats[r]['gds_std']
+            gm_target = (log_gm - gm_means) / gm_stds
+            gds_target = (log_gds - gds_means) / gds_stds
+        else:
+            gm_target = (log_gm - gm_mean) / gm_std
+            gds_target = (log_gds - gds_mean) / gds_std
+
+        if huber_delta > 0:
+            gm_loss = F.huber_loss(gm_pred[valid], gm_target, delta=huber_delta)
+            gds_loss = F.huber_loss(gds_pred[valid], gds_target, delta=huber_delta)
+        else:
+            gm_loss = F.mse_loss(gm_pred[valid], gm_target)
+            gds_loss = F.mse_loss(gds_pred[valid], gds_target)
     else:
         gm_loss = torch.tensor(0.0, device=device)
         gds_loss = torch.tensor(0.0, device=device)
 
     return gm_loss, gds_loss
+
+
+# IV Model ID Prediction Loss
+def compute_iv_id_loss(
+    log_abs_id_pred: torch.Tensor,
+    mosfet_info: torch.Tensor,
+    node_current_targets: torch.Tensor,
+    current_mean: float,
+    current_std: float,
+    ptr: torch.Tensor,
+    mosfet_ptr: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    MSE loss on IV model's log10(|ID|) vs GT drain current.
+
+    GT drain current comes from node_current_targets at drain terminal indices,
+    which are stored in z-scored log10(|I|) space.
+
+    Args:
+        log_abs_id_pred: [num_mosfets] predicted log10(|ID|) from IV model
+        mosfet_info: [num_mosfets, 7] MOSFET info tensor
+        node_current_targets: [num_nodes] z-scored log10(|I|) targets
+        current_mean: Mean for current denormalization (log10 scale)
+        current_std: Std for current denormalization (log10 scale)
+        ptr: Node boundaries per graph [num_graphs + 1]
+        mosfet_ptr: Cumulative MOSFET counts per graph [num_graphs + 1], or None
+
+    Returns:
+        Scalar loss tensor
+    """
+    device = log_abs_id_pred.device
+    num_mosfets = mosfet_info.shape[0]
+    drain_idx = mosfet_info[:, 1].long()
+
+    # Compute per-MOSFET node offsets for batched graphs
+    num_graphs = ptr.shape[0] - 1
+    if mosfet_ptr is not None:
+        mg_idx = torch.bucketize(
+            torch.arange(num_mosfets, device=device),
+            mosfet_ptr[1:].to(device), right=True,
+        )
+    else:
+        devices_per_graph = num_mosfets // num_graphs
+        mg_idx = torch.arange(num_mosfets, device=device) // devices_per_graph
+    offsets = ptr[mg_idx]
+
+    # GT drain current: z-scored log10 -> denorm to log10(|I|)
+    gt_zscore = node_current_targets.to(device)[drain_idx + offsets]
+    gt_log_abs_id = gt_zscore * current_std + current_mean  # log10(|ID|)
+
+    valid = torch.isfinite(gt_log_abs_id) & (gt_log_abs_id > -15)
+    if valid.any():
+        return F.mse_loss(log_abs_id_pred[valid], gt_log_abs_id[valid])
+    return torch.tensor(0.0, device=device)
 
 
 # AC Prediction Loss
@@ -1177,9 +1284,11 @@ def compute_ac_loss(
         Scalar loss tensor (MSE on normalized targets, only valid samples)
     """
     device = ac_pred.device
+    zero = torch.tensor(0.0, device=device)
 
     if ac_valid is None or not ac_valid.any() or len(ac_components) == 0:
-        return torch.tensor(0.0, device=device)
+        per_component = {comp: zero for comp in ac_components} if ac_components else {}
+        return zero, per_component
 
     # Filter to valid samples
     valid_pred = ac_pred[ac_valid]  # [N_valid, num_components]
@@ -1200,7 +1309,12 @@ def compute_ac_loss(
     ac_std = ac_std.to(device)
     target_norm = (target - ac_mean) / ac_std.clamp(min=1e-6)
 
-    return F.mse_loss(valid_pred, target_norm)
+    # Per-component losses
+    per_component = {}
+    for i, comp in enumerate(ac_components):
+        per_component[comp] = F.mse_loss(valid_pred[:, i], target_norm[:, i])
+
+    return F.mse_loss(valid_pred, target_norm), per_component
 
 
 # Region Classification Loss
@@ -1233,6 +1347,40 @@ def compute_region_loss(
     target = node_region_labels[mask].float().to(device)  # 0.0, 1.0, 2.0
 
     return F.mse_loss(pred, target)
+
+
+def compute_region_loss_coral(
+    region_logits: torch.Tensor,
+    mosfet_region_labels: torch.Tensor,
+) -> torch.Tensor:
+    """
+    CORAL ordinal cross-entropy loss for MOSFET operating region prediction.
+
+    Uses two binary classifiers for ordinal thresholds:
+      - t1: P(region >= triode) = sigma(logit_1)
+      - t2: P(region >= saturation) = sigma(logit_2)
+
+    Args:
+        region_logits: [num_mosfets, 2] raw logits for ordinal thresholds
+        mosfet_region_labels: [num_mosfets] 0=cutoff, 1=triode, 2=saturation
+
+    Returns:
+        Scalar CORAL loss (mean BCE over both thresholds)
+    """
+    device = region_logits.device
+    labels = mosfet_region_labels.to(device).long()
+
+    # Binary targets for each threshold
+    # t1: 1 if region >= 1 (triode or saturation), 0 if cutoff
+    # t2: 1 if region >= 2 (saturation), 0 if cutoff or triode
+    t1_target = (labels >= 1).float()
+    t2_target = (labels >= 2).float()
+
+    # BCE on each threshold
+    loss_t1 = F.binary_cross_entropy_with_logits(region_logits[:, 0], t1_target)
+    loss_t2 = F.binary_cross_entropy_with_logits(region_logits[:, 1], t2_target)
+
+    return (loss_t1 + loss_t2) / 2
 
 
 def _batch_offsets(num_devices, device_ptr, ptr, device):
@@ -1289,6 +1437,30 @@ def compute_device_consistency_loss(
             count += p_idx.shape[0]
 
     return total / max(count, 1)
+
+
+class UncertaintyWeights(nn.Module):
+    """Kendall et al. 2018 with normalized weights — prevents magnitude explosion.
+
+    Weights are normalized to sum to N_tasks, preserving relative adaptation
+    while keeping total gradient magnitude constant.
+    """
+    def __init__(self, task_names):
+        super().__init__()
+        self.log_vars = nn.ParameterDict({
+            name: nn.Parameter(torch.zeros(1)) for name in task_names
+        })
+
+    def get_weights(self):
+        """Normalized weights that sum to N_tasks."""
+        raw = {name: torch.exp(-lv) for name, lv in self.log_vars.items()}
+        total = sum(raw.values())
+        n = len(raw)
+        return {name: n * w / total for name, w in raw.items()}
+
+    def regularizer(self):
+        """Sum of log_var / 2 — prevents all weights from collapsing to equal."""
+        return sum(lv for lv in self.log_vars.values()) / 2
 
 
 # Combined Loss
@@ -1370,6 +1542,8 @@ def compute_combined_loss(
     ss_gds_pred: torch.Tensor = None,
     mosfet_gm: torch.Tensor = None,
     mosfet_gds: torch.Tensor = None,
+    ss_huber_delta: float = 0.0,
+    ss_region_stats: dict = None,
     # Triode physics regularizer loss parameters
     triode_physics_loss_weight: float = 0.0,
     triode_physics_config: dict = None,
@@ -1388,12 +1562,32 @@ def compute_combined_loss(
     region_pred: torch.Tensor = None,
     node_region_labels: torch.Tensor = None,
     mosfet_drain_mask: torch.Tensor = None,
+    region_logits: torch.Tensor = None,
     # Device consistency loss
     device_consistency_weight: float = 0.0,
     batch=None,
     # Intermediate KCL (deep supervision)
     kcl_intermediate_weight: float = 0.0,
     aux_node_currents: torch.Tensor = None,
+    # Vov prediction loss
+    vov_loss_weight: float = 0.0,
+    vov_pred: torch.Tensor = None,
+    mosfet_vov_valid: torch.Tensor = None,
+    # Vth prediction loss
+    vth_loss_weight: float = 0.0,
+    vth_pred: torch.Tensor = None,
+    mosfet_vth: torch.Tensor = None,
+    # IV model ID prediction loss
+    iv_id_loss_weight: float = 0.0,
+    iv_log_abs_id: torch.Tensor = None,
+    # DC gain prediction loss
+    dc_gain_loss_weight: float = 0.0,
+    dc_gain_pred: torch.Tensor = None,
+    dc_gain_target: torch.Tensor = None,
+    dc_gain_mean: float = 0.0,
+    dc_gain_std: float = 1.0,
+    # Uncertainty weighting
+    uncertainty_weights = None,
 ) -> tuple:
     """
     Compute combined loss from all components.
@@ -1571,8 +1765,9 @@ def compute_combined_loss(
 
     # AC prediction loss
     ac_loss = torch.tensor(0.0, device=voltage_loss.device)
+    ac_per_component = {}
     if ac_loss_weight > 0 and ac_pred is not None and ac_mean is not None and ac_components:
-        ac_loss = compute_ac_loss(
+        ac_loss, ac_per_component = compute_ac_loss(
             ac_pred=ac_pred,
             ac_valid=ac_valid,
             ac_mean=ac_mean,
@@ -1596,6 +1791,9 @@ def compute_combined_loss(
             gm_std=ss_gm_std,
             gds_mean=ss_gds_mean,
             gds_std=ss_gds_std,
+            huber_delta=ss_huber_delta,
+            region_stats=ss_region_stats,
+            mosfet_region_labels=mosfet_region_labels,
         )
 
     # Triode physics regularizer loss
@@ -1653,14 +1851,22 @@ def compute_combined_loss(
             mosfet_ptr=mosfet_ptr,
         )
 
-    # Region loss (ordinal regression)
+    # Region loss (CORAL ordinal cross-entropy or MSE fallback)
     region_loss = torch.tensor(0.0, device=voltage_loss.device)
-    if region_loss_weight > 0 and region_pred is not None and node_region_labels is not None and mosfet_drain_mask is not None:
-        region_loss = compute_region_loss(
-            region_pred=region_pred,
-            mosfet_drain_mask=mosfet_drain_mask,
-            node_region_labels=node_region_labels,
-        )
+    if region_loss_weight > 0:
+        if region_logits is not None and mosfet_region_labels is not None:
+            # CORAL: per-MOSFET ordinal logits
+            region_loss = compute_region_loss_coral(
+                region_logits=region_logits,
+                mosfet_region_labels=mosfet_region_labels,
+            )
+        elif region_pred is not None and node_region_labels is not None and mosfet_drain_mask is not None:
+            # Legacy: per-node MSE
+            region_loss = compute_region_loss(
+                region_pred=region_pred,
+                mosfet_drain_mask=mosfet_drain_mask,
+                node_region_labels=node_region_labels,
+            )
 
     # Device consistency loss
     if device_consistency_weight > 0 and current_pred is not None and batch is not None:
@@ -1668,18 +1874,80 @@ def compute_combined_loss(
     else:
         dev_consistency_loss = torch.tensor(0.0, device=voltage_pred.device)
 
-    total_loss = (voltage_weight * voltage_loss +
-                  current_weight * current_loss +
-                  kcl_weight * kcl_loss +
-                  constraint_weight * constraint_loss +
-                  gm_physics_loss_weight * gm_physics_loss +
-                  ac_loss_weight * ac_loss +
-                  ss_gm_loss_weight * ss_gm_loss +
-                  ss_gds_loss_weight * ss_gds_loss +
-                  triode_physics_loss_weight * triode_physics_loss +
-                  cutoff_physics_loss_weight * cutoff_physics_loss +
-                  region_loss_weight * region_loss +
-                  device_consistency_weight * dev_consistency_loss +
-                  kcl_intermediate_weight * kcl_intermediate_loss)
+    # Vov prediction loss
+    vov_loss = torch.tensor(0.0, device=voltage_pred.device)
+    if vov_loss_weight > 0 and vov_pred is not None and mosfet_gt_vov is not None:
+        vov_loss = compute_vov_loss(vov_pred, mosfet_gt_vov, mosfet_vov_valid)
 
-    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss
+    # Vth prediction loss
+    vth_loss = torch.tensor(0.0, device=voltage_pred.device)
+    if vth_loss_weight > 0 and vth_pred is not None and mosfet_vth is not None:
+        vth_loss = compute_vth_loss(vth_pred, mosfet_vth.to(voltage_pred.device))
+
+    # IV model ID prediction loss
+    iv_id_loss = torch.tensor(0.0, device=voltage_pred.device)
+    if iv_id_loss_weight > 0 and iv_log_abs_id is not None and current_target is not None:
+        iv_id_loss = compute_iv_id_loss(
+            log_abs_id_pred=iv_log_abs_id,
+            mosfet_info=mosfet_info,
+            node_current_targets=current_target,
+            current_mean=current_mean,
+            current_std=current_std,
+            ptr=ptr,
+            mosfet_ptr=mosfet_ptr,
+        )
+
+    # DC gain prediction loss (z-scored MSE, all samples)
+    dc_gain_loss = torch.tensor(0.0, device=voltage_pred.device)
+    if dc_gain_loss_weight > 0 and dc_gain_pred is not None and dc_gain_target is not None:
+        dc_gain_target_z = (dc_gain_target - dc_gain_mean) / max(dc_gain_std, 1e-6)
+        dc_gain_loss = F.mse_loss(dc_gain_pred, dc_gain_target_z)
+
+    if uncertainty_weights is not None:
+        # Normalized uncertainty weighting (Kendall et al. 2018, weights sum to N_tasks)
+        uw = uncertainty_weights.get_weights()
+        total_loss = torch.tensor(0.0, device=voltage_pred.device)
+        if voltage_weight > 0:
+            total_loss = total_loss + uw['voltage'] * voltage_loss
+        if current_weight > 0:
+            total_loss = total_loss + uw['current'] * current_loss
+        if ss_gm_loss_weight > 0:
+            total_loss = total_loss + uw['ss_gm'] * ss_gm_loss
+        if ss_gds_loss_weight > 0:
+            total_loss = total_loss + uw['ss_gds'] * ss_gds_loss
+        if vov_loss_weight > 0:
+            total_loss = total_loss + uw['vov'] * vov_loss
+        # Log_var regularizer (prevents all weights from becoming equal)
+        total_loss = total_loss + uncertainty_weights.regularizer()
+        # Regularizers: keep static weights
+        total_loss = total_loss + (kcl_weight * kcl_loss +
+                                   constraint_weight * constraint_loss +
+                                   gm_physics_loss_weight * gm_physics_loss +
+                                   ac_loss_weight * ac_loss +
+                                   triode_physics_loss_weight * triode_physics_loss +
+                                   cutoff_physics_loss_weight * cutoff_physics_loss +
+                                   region_loss_weight * region_loss +
+                                   device_consistency_weight * dev_consistency_loss +
+                                   kcl_intermediate_weight * kcl_intermediate_loss +
+                                   iv_id_loss_weight * iv_id_loss +
+                                   dc_gain_loss_weight * dc_gain_loss)
+    else:
+        total_loss = (voltage_weight * voltage_loss +
+                      current_weight * current_loss +
+                      kcl_weight * kcl_loss +
+                      constraint_weight * constraint_loss +
+                      gm_physics_loss_weight * gm_physics_loss +
+                      ac_loss_weight * ac_loss +
+                      ss_gm_loss_weight * ss_gm_loss +
+                      ss_gds_loss_weight * ss_gds_loss +
+                      triode_physics_loss_weight * triode_physics_loss +
+                      cutoff_physics_loss_weight * cutoff_physics_loss +
+                      region_loss_weight * region_loss +
+                      device_consistency_weight * dev_consistency_loss +
+                      kcl_intermediate_weight * kcl_intermediate_loss +
+                      vov_loss_weight * vov_loss +
+                      vth_loss_weight * vth_loss +
+                      iv_id_loss_weight * iv_id_loss +
+                      dc_gain_loss_weight * dc_gain_loss)
+
+    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss
