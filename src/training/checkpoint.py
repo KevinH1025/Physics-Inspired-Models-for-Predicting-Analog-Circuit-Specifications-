@@ -439,9 +439,18 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         vov_head_config=config.get('vov_head_config', {}),
         vth_head_config=config.get('vth_head_config', {}),
         dc_gain_config=config.get('dc_gain_config', {}),
-        act_type=config.get('act_type', 'relu'),
-        loop_attention_config=config.get('loop_attention_config', {}),
-        gm_id_head_config=config.get('gm_id_head_config', {}),
+        act_type=config.get('act_type', 'gelu' if any('gelu' in k.lower() for k in state_dict.keys()) else 'relu'),
+        loop_attention_config=config.get('loop_attention_config',
+            {'enabled': True, 'num_heads': 4, 'head_dim': 32, 'apply_to': 'backbone', 'fusion': 'gate'}
+            if any('loop_attn' in k for k in state_dict.keys()) else {}),
+        gm_id_head_config=config.get('gm_id_head_config',
+            {'enabled': True} if any('gm_id_head.' in k for k in state_dict.keys()) else {}),
+        vn_mode=config.get('vn_config', {}).get('mode',
+            'mha' if any('virtual_node.W_q' in k for k in state_dict.keys()) else 'default'),
+        vn_num_heads=config.get('vn_config', {}).get('num_heads', 4),
+        vn_head_dim=config.get('vn_config', {}).get('head_dim', 32),
+        vn_gate_broadcast=config.get('vn_config', {}).get('gate_broadcast',
+            any('virtual_node.gate_projs' in k for k in state_dict.keys())),
     )
 
     # Load weights and move to device
