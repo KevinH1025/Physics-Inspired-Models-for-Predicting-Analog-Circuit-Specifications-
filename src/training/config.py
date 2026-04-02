@@ -43,6 +43,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['dropout'] = model_cfg.get('dropout', 0.0)
     args['genconv_num_layers'] = model_cfg.get('genconv_num_layers', 2)
     args['norm_type'] = model_cfg.get('norm_type', 'layer')
+    args['act_type'] = model_cfg.get('act_type', 'relu')
     args['skip_connection'] = model_cfg.get('skip_connection', True)
     args['gradient_checkpointing'] = model_cfg.get('gradient_checkpointing', False)
 
@@ -161,8 +162,20 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'detach_ss': dc_gain_cfg.get('detach_ss', False),
         'r_in': dc_gain_cfg.get('r_in', 50000.0),
         'r_f': dc_gain_cfg.get('r_f', 50000.0),
-        'use_vn_context': dc_gain_cfg.get('use_vn_context', False),
+        'use_vn_context': dc_gain_cfg.get('use_vn_context', dc_gain_cfg.get('use_vn', False)),
         'vn_projection_dim': dc_gain_cfg.get('vn_projection_dim', 0),
+        'use_device_context': dc_gain_cfg.get('use_device_context', False),
+        'device_proj_dim': dc_gain_cfg.get('device_proj_dim', 32),
+        'rout1_formula': dc_gain_cfg.get('rout1_formula', 'cascode'),
+    }
+
+    # gm/Id auxiliary prediction head
+    gm_id_cfg = heads_cfg.get('gm_id', {})
+    args['gm_id_head_config'] = {
+        'enabled': gm_id_cfg.get('enabled', False),
+        'hidden_dim': gm_id_cfg.get('hidden_dim', 128),
+        'num_layers': gm_id_cfg.get('num_layers', 2),
+        'as_feature': gm_id_cfg.get('as_feature', False),
     }
 
     # gm/gds (small-signal) prediction head
@@ -195,6 +208,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'mixture_of_experts': ss_head_cfg.get('mixture_of_experts', False),
         'expert_hidden_dim': ss_head_cfg.get('expert_hidden_dim', 256),
         'expert_num_layers': ss_head_cfg.get('expert_num_layers', 2),
+        'predict_gm_id': ss_head_cfg.get('predict_gm_id', False),
     }
     # Differentiable I-V model config (nested under ss head)
     iv_cfg = ss_head_cfg.get('iv_model', {})
@@ -265,6 +279,9 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'apply_to': loop_attn_cfg.get('apply_to', 'backbone'),
         'fusion': loop_attn_cfg.get('fusion', 'add'),
         'warmup_epochs': loop_attn_cfg.get('warmup_epochs', 0),
+        'warmup_duration': loop_attn_cfg.get('warmup_duration', 0),
+        'level': loop_attn_cfg.get('level', 'device'),
+        'pool_mode': loop_attn_cfg.get('pool_mode', 'mean'),
     }
 
     # Loss - support both nested and flat formats
@@ -303,6 +320,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # Stage 2 node weighting (upweight critical output nodes)
     args['stage2_weight'] = loss_cfg.get('stage2_weight', 1.0)
     args['stage2_nodes'] = loss_cfg.get('stage2_nodes', None)
+    args['node_weights'] = loss_cfg.get('node_weights', None)
 
     # Physics-based current constraints (diff pair, current mirrors)
     constraint_cfg = loss_cfg.get('current_constraints', {})
@@ -349,12 +367,21 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['ac_loss_weight'] = ac_cfg.get('weight', 0.0)
     args['ac_loss_start_epoch'] = ac_cfg.get('start_epoch', 0)
     args['ac_loss_warmup_epochs'] = ac_cfg.get('warmup_epochs', 0)
+    args['ac_pred_filter'] = ac_cfg.get('pred_filter', False)
 
     # DC gain prediction loss
     dc_gain_loss_cfg = loss_cfg.get('dc_gain_loss', {})
     args['dc_gain_loss_weight'] = dc_gain_loss_cfg.get('weight', 0.0)
     args['dc_gain_warmup_epochs'] = dc_gain_loss_cfg.get('warmup_epochs', 0)
     args['dc_gain_start_epoch'] = dc_gain_loss_cfg.get('start_epoch', 0)
+
+    # gm/Id consistency loss
+    gm_id_cfg = loss_cfg.get('gm_id_consistency', {})
+    args['gm_id_consistency_weight'] = gm_id_cfg.get('weight', 0.0)
+
+    # gm/Id auxiliary loss
+    gm_id_aux_cfg = loss_cfg.get('gm_id_aux', {})
+    args['gm_id_aux_weight'] = gm_id_aux_cfg.get('weight', 0.0)
 
     # Device consistency loss
     args['device_consistency_weight'] = loss_cfg.get('device_consistency_weight', 0.0)

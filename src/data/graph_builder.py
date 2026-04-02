@@ -439,6 +439,7 @@ class CircuitGraphBuilder:
             mirror_constraints=mirror_constraints,
             output_stage_constraints=output_stage_constraints,
             lambda_mirror_constraints=lambda_mirror_constraints,
+            mosfet_device_names=mosfet_device_names,
             terminal_train_mask=terminal_train_mask,
             terminal_vdc=terminal_vdc,
             loop_edge_index=loop_edge_index,
@@ -581,15 +582,20 @@ class CircuitGraphBuilder:
 
             # Target is always magnitude — supervised via MSE regardless of KCL
             current_targets[i] = abs_current
-            # Capacitors: DC current is 0 but include for KCL completeness
+            # Capacitors: DC current is 0, no supervision but include for KCL
             if device_type == 'C':
-                has_current_mask[i] = True
+                has_current_mask[i] = False
                 kcl_include_mask[i] = True
                 current_targets[i] = 0.0
+            elif device_type in ('V', 'I'):
+                # Voltage/current sources: don't supervise (known/fixed quantities)
+                # but include in KCL for current conservation
+                has_current_mask[i] = False
+                kcl_include_mask[i] = significant
+                current_targets[i] = abs_current
             else:
                 has_current_mask[i] = has_target and significant
                 # KCL inclusion: all devices with significant current
-                # (including V-sources for supply net KCL)
                 if device_type == 'M':
                     kcl_include_mask[i] = True
                 else:

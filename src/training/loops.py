@@ -15,47 +15,73 @@ from src.training.metrics import (
 )
 
 
+_cached_node_weights = {}
+
 def build_voltage_node_weights(
     batch,
     stage2_nodes: list = None,
     stage2_weight: float = 1.0,
+    node_weights: dict = None,
     device: torch.device = None,
 ) -> torch.Tensor:
     """
-    Build per-node weights for voltage loss. Stage 2 nodes get extra weight.
-
-    Supports mixed-topology batches by iterating per-graph.
+    Build per-node weights for voltage loss. Cached after first call per batch size.
 
     Args:
         batch: Batch with node_names and train_mask
-        stage2_nodes: List of stage 2 node names to upweight
-        stage2_weight: Weight multiplier for stage 2 nodes (1.0 = no extra weight)
+        stage2_nodes: List of node names to upweight (legacy)
+        stage2_weight: Weight multiplier for stage2 nodes (1.0 = disabled)
+        node_weights: Dict of {node_name: weight} for per-net weights (overrides stage2)
         device: Device to create tensor on
 
     Returns:
         Tensor of weights matching train_mask True count, or None if disabled
     """
-    if stage2_weight <= 1.0 or stage2_nodes is None:
-        return None
-
     if not hasattr(batch, 'node_names') or batch.node_names is None:
         return None
 
-    stage2_set = {n.lower() for n in stage2_nodes}
-    ptr = batch.ptr
-    num_graphs = len(ptr) - 1
-
-    weights = []
-    for g in range(num_graphs):
-        start, end = ptr[g].item(), ptr[g + 1].item()
-        mask_g = batch.train_mask[start:end]
-        names_g = batch.node_names[g]
+    # Per-net weights dict takes priority
+    if node_weights:
+        num_masked = batch.train_mask.sum().item()
+        cache_key = ('nw', num_masked)
+        if cache_key in _cached_node_weights:
+            return _cached_node_weights[cache_key].to(device)
+        node_weights_lower = {k.lower(): v for k, v in node_weights.items()}
+        # Build for single graph, then tile
+        names_g = batch.node_names[0]
+        mask_g = batch.train_mask[:len(names_g)]
+        per_graph_w = []
         for j, name in enumerate(names_g):
             if mask_g[j]:
-                w = stage2_weight if name.lower() in stage2_set else 1.0
-                weights.append(w)
+                per_graph_w.append(node_weights_lower.get(name.lower(), 1.0))
+        per_graph_t = torch.tensor(per_graph_w, dtype=torch.float32)
+        num_graphs = len(batch.ptr) - 1
+        result = per_graph_t.repeat(num_graphs)
+        _cached_node_weights[cache_key] = result
+        return result.to(device)
 
-    return torch.tensor(weights, device=device, dtype=torch.float32)
+    # Legacy stage2 weighting
+    if stage2_weight <= 1.0 or stage2_nodes is None:
+        return None
+
+    num_masked = batch.train_mask.sum().item()
+    cache_key = ('s2', num_masked)
+    if cache_key in _cached_node_weights:
+        return _cached_node_weights[cache_key].to(device)
+
+    stage2_set = {n.lower() for n in stage2_nodes}
+    names_g = batch.node_names[0]
+    mask_g = batch.train_mask[:len(names_g)]
+    per_graph_w = []
+    for j, name in enumerate(names_g):
+        if mask_g[j]:
+            w = stage2_weight if name.lower() in stage2_set else 1.0
+            per_graph_w.append(w)
+    per_graph_t = torch.tensor(per_graph_w, dtype=torch.float32)
+    num_graphs = len(batch.ptr) - 1
+    result = per_graph_t.repeat(num_graphs)
+    _cached_node_weights[cache_key] = result
+    return result.to(device)
 
 
 def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
@@ -64,7 +90,7 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 loss_type='mse', huber_delta=1.0, kcl_min_current=1e-9,
                 constraint_weight=0.0, amp_dtype=None,
                 vdc_mean=0.0, vdc_std=1.0, lambda_n=0.05,
-                stage2_nodes=None, stage2_weight=1.0,
+                stage2_nodes=None, stage2_weight=1.0, node_weights=None,
                 use_terminal_voltage_loss=False,
                 gm_physics_loss_weight=0.0, gm_physics_min_vov=0.0, gm_physics_use_clm=False,
                 gm_physics_use_gt_voltages=True,
@@ -87,7 +113,10 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 uncertainty_weights=None,
                 ss_region_stats=None,
                 iv_id_loss_weight=0.0,
-                dc_gain_loss_weight=0.0, dc_gain_mean=0.0, dc_gain_std=1.0):
+                dc_gain_loss_weight=0.0, dc_gain_mean=0.0, dc_gain_std=1.0,
+                gm_id_consistency_weight=0.0,
+                gm_id_aux_weight=0.0, gm_id_mean=0.0, gm_id_std=1.0,
+                mirror_pair_indices=None, mirror_pair_ratios=None, mirror_pair_names=None):
     """
     Train for one epoch.
 
@@ -152,6 +181,10 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     total_vov_loss = 0
     total_vth_loss = 0
     total_dc_gain_loss = 0
+    total_gm_id_loss = 0
+    total_gm_id_aux_loss = 0
+    total_hardcoded_mirror_loss = 0
+    total_mirror_pair_losses = {}
     max_grad_norm = 0.0
     sum_grad_norm = 0.0
     grad_norm_count = 0
@@ -197,10 +230,10 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
 
             # Build voltage node weights for stage2 upweighting (only for net-node loss)
             voltage_node_weights = build_voltage_node_weights(
-                batch, stage2_nodes, stage2_weight, device=device
+                batch, stage2_nodes, stage2_weight, node_weights=node_weights, device=device
             ) if not use_terminal_voltage_loss else None
 
-            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss = compute_combined_loss(
+            loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss, gm_id_loss, gm_id_aux_loss, hardcoded_mirror_loss, batch_mirror_pair_losses = compute_combined_loss(
                 voltage_pred=pred,
                 voltage_target=target,
                 current_pred=out_currents,
@@ -302,6 +335,15 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
                 dc_gain_target=batch.ac_dc_gain if hasattr(batch, 'ac_dc_gain') else None,
                 dc_gain_mean=dc_gain_mean,
                 dc_gain_std=dc_gain_std,
+                gm_id_consistency_weight=gm_id_consistency_weight,
+                node_current_targets=batch.node_current_targets if predict_currents else None,
+                gm_id_aux_weight=gm_id_aux_weight,
+                gm_id_pred=out_dict.get('mosfet_gm_id_pred'),
+                gm_id_mean=gm_id_mean,
+                gm_id_std=gm_id_std,
+                mirror_pair_indices=mirror_pair_indices,
+                mirror_pair_ratios=mirror_pair_ratios,
+                mirror_pair_names=mirror_pair_names,
             )
 
             # Intermediate voltage auxiliary loss
@@ -380,6 +422,14 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
             total_vth_loss += vth_loss.detach().float() * batch_size
         if dc_gain_loss_weight > 0:
             total_dc_gain_loss += dc_gain_loss.detach().float() * batch_size
+        if gm_id_consistency_weight > 0:
+            total_gm_id_loss += gm_id_loss.detach().float() * batch_size
+        if gm_id_aux_weight > 0:
+            total_gm_id_aux_loss += gm_id_aux_loss.detach().float() * batch_size
+        if constraint_weight > 0 and mirror_pair_indices is not None and len(mirror_pair_indices) > 0:
+            total_hardcoded_mirror_loss += hardcoded_mirror_loss.detach().float() * batch_size
+            for pname, ploss in batch_mirror_pair_losses.items():
+                total_mirror_pair_losses[pname] = total_mirror_pair_losses.get(pname, 0) + ploss * batch_size
 
     avg_loss = (total_loss / total_count).item()
     avg_voltage_loss = (total_voltage_loss / total_count).item()
@@ -405,16 +455,20 @@ def train_epoch(model, loader, optimizer, gradient_clip, device, scaler=None,
     avg_vov_loss = (total_vov_loss / total_count).item() if vov_loss_weight > 0 else 0.0
     avg_vth_loss = (total_vth_loss / total_count).item() if vth_loss_weight > 0 else 0.0
     avg_dc_gain_loss = (total_dc_gain_loss / total_count).item() if dc_gain_loss_weight > 0 else 0.0
+    avg_gm_id_loss = (total_gm_id_loss / total_count).item() if gm_id_consistency_weight > 0 else 0.0
+    avg_gm_id_aux_loss = (total_gm_id_aux_loss / total_count).item() if gm_id_aux_weight > 0 else 0.0
+    avg_hardcoded_mirror_loss = (total_hardcoded_mirror_loss / total_count).item() if constraint_weight > 0 and mirror_pair_indices is not None and len(mirror_pair_indices) > 0 else 0.0
+    avg_mirror_pair_losses = {k: v / total_count for k, v in total_mirror_pair_losses.items()} if total_mirror_pair_losses else {}
     avg_grad_norm = sum_grad_norm / max(grad_norm_count, 1)
 
-    return avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, avg_vov_loss, avg_vth_loss, avg_ac_component_losses, avg_dc_gain_loss, max_grad_norm, avg_grad_norm
+    return avg_loss, mae_norm, avg_voltage_loss, avg_current_loss, current_mae_ua, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, avg_vov_loss, avg_vth_loss, avg_ac_component_losses, avg_dc_gain_loss, max_grad_norm, avg_grad_norm, avg_gm_id_loss, avg_gm_id_aux_loss, avg_hardcoded_mirror_loss, avg_mirror_pair_losses
 
 
 def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,
              predict_currents=False, current_weight=1.0, voltage_weight=1.0, kcl_weight=0.0,
              loss_type='mse', huber_delta=1.0, kcl_min_current=1e-9,
              constraint_weight=0.0, lambda_n=0.05,
-             stage2_nodes=None, stage2_weight=1.0,
+             stage2_nodes=None, stage2_weight=1.0, node_weights=None,
              use_terminal_voltage_loss=False,
              gm_physics_loss_weight=0.0, gm_physics_min_vov=0.0, gm_physics_use_clm=False,
              gm_physics_use_gt_voltages=True,
@@ -435,7 +489,11 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
              vth_loss_weight=0.0,
              ss_region_stats=None,
              iv_id_loss_weight=0.0,
-             dc_gain_loss_weight=0.0, dc_gain_mean=0.0, dc_gain_std=1.0):
+             dc_gain_loss_weight=0.0, dc_gain_mean=0.0, dc_gain_std=1.0,
+             gm_id_consistency_weight=0.0,
+             gm_id_aux_weight=0.0, gm_id_mean=0.0, gm_id_std=1.0,
+             mirror_pair_indices=None, mirror_pair_ratios=None, mirror_pair_names=None,
+             ac_pred_filter=False):
     """
     Validate the model.
 
@@ -473,6 +531,10 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     total_vov_loss = 0
     total_vth_loss = 0
     total_dc_gain_loss = 0
+    total_gm_id_loss = 0
+    total_gm_id_aux_loss = 0
+    total_hardcoded_mirror_loss = 0
+    total_mirror_pair_losses = {}
     total_mae = 0
     total_count = 0
     total_current_mae = 0
@@ -487,6 +549,9 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     all_gds_rel = []
     all_gm_log_errors = []
     all_gds_log_errors = []
+    all_gm_id_rel = []
+    all_gm_id_log_errors = []
+    all_dc_gain_errors = []
     # MoE diagnostics
     moe_region_probs_sum = None  # running sum of predicted region probs [3]
     moe_region_correct = 0
@@ -535,10 +600,21 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
 
         # Build voltage node weights for stage2 upweighting (only for net-node loss)
         voltage_node_weights = build_voltage_node_weights(
-            batch, stage2_nodes, stage2_weight, device=device
+            batch, stage2_nodes, stage2_weight, node_weights=node_weights, device=device
         ) if not use_terminal_voltage_loss else None
 
-        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss = compute_combined_loss(
+        # Compute AC validity mask (GT or predicted DC gain filter)
+        if ac_pred_filter and out_dict.get('dc_gain_pred') is not None and hasattr(batch, 'ac_valid'):
+            _dc_pred_dB = (out_dict['dc_gain_pred'] * dc_gain_std + dc_gain_mean).detach()
+            _ac_valid_mask = batch.ac_valid & (_dc_pred_dB > 0)
+        elif hasattr(batch, 'ac_valid') and hasattr(batch, 'ac_dc_gain'):
+            _ac_valid_mask = batch.ac_valid & (batch.ac_dc_gain > 0)
+        elif hasattr(batch, 'ac_valid'):
+            _ac_valid_mask = batch.ac_valid
+        else:
+            _ac_valid_mask = None
+
+        loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss, gm_id_loss, gm_id_aux_loss, hardcoded_mirror_loss, batch_mirror_pair_losses = compute_combined_loss(
             voltage_pred=pred,
             voltage_target=target,
             current_pred=out_currents,
@@ -597,7 +673,7 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             ac_ugbw=batch.ac_ugbw if hasattr(batch, 'ac_ugbw') else None,
             ac_pm=batch.ac_pm if hasattr(batch, 'ac_pm') else None,
             ac_am=batch.ac_am if hasattr(batch, 'ac_am') else None,
-            ac_valid=batch.ac_valid & (batch.ac_dc_gain > 0) if hasattr(batch, 'ac_valid') and hasattr(batch, 'ac_dc_gain') else (batch.ac_valid if hasattr(batch, 'ac_valid') else None),
+            ac_valid=_ac_valid_mask,
             ac_mean=ac_mean,
             ac_std=ac_std,
             ac_components=ac_components or out_dict.get('ac_components'),
@@ -638,6 +714,15 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             dc_gain_target=batch.ac_dc_gain if hasattr(batch, 'ac_dc_gain') else None,
             dc_gain_mean=dc_gain_mean,
             dc_gain_std=dc_gain_std,
+            gm_id_consistency_weight=gm_id_consistency_weight,
+            node_current_targets=batch.node_current_targets if predict_currents else None,
+            gm_id_aux_weight=gm_id_aux_weight,
+            gm_id_pred=out_dict.get('mosfet_gm_id_pred'),
+            gm_id_mean=gm_id_mean,
+            gm_id_std=gm_id_std,
+            mirror_pair_indices=mirror_pair_indices,
+            mirror_pair_ratios=mirror_pair_ratios,
+            mirror_pair_names=mirror_pair_names,
         )
 
         # Track current loss and MAE
@@ -714,6 +799,31 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
                     all_gm_log_errors.extend((gm_pred_log - gm_tgt_log).abs().cpu().tolist())
                     all_gds_log_errors.extend((gds_pred_log - gds_tgt_log).abs().cpu().tolist())
 
+            # gm/Id metrics (when predicting gm/Id from sensitivity tower)
+            gm_id_pred_ss = out_dict.get('mosfet_gm_id_pred')
+            if gm_id_pred_ss is not None and mosfet_gm is not None:
+                valid = mosfet_gm.to(device) > 1e-12
+                if valid.any():
+                    # Denormalize prediction
+                    gm_id_pred_log = gm_id_pred_ss[valid] * gm_id_std + gm_id_mean
+                    # GT: log10(gm/Id) = log10(gm) - log10(|Id|)
+                    gt_log_gm = torch.log10(mosfet_gm.to(device)[valid].clamp(min=1e-20))
+                    mi = batch.mosfet_info.long()
+                    num_m = mi.shape[0]
+                    num_g = batch.ptr.shape[0] - 1
+                    mp = getattr(batch, 'mosfet_ptr', None)
+                    if mp is not None:
+                        mg = torch.bucketize(torch.arange(num_m, device=device), mp[1:].to(device), right=True)
+                    else:
+                        mg = torch.arange(num_m, device=device) // (num_m // num_g)
+                    offs = batch.ptr.to(device)[mg]
+                    gt_log_id = batch.node_current_targets.to(device)[mi[:, 1] + offs] * current_std + current_mean
+                    gt_gm_id_log = gt_log_gm - gt_log_id[valid]
+                    # Relative error in linear scale
+                    gm_id_rel = ((torch.pow(10, gm_id_pred_log) - torch.pow(10, gt_gm_id_log)).abs() / torch.pow(10, gt_gm_id_log).clamp(min=1e-15) * 100)
+                    all_gm_id_rel.extend(gm_id_rel.cpu().tolist())
+                    all_gm_id_log_errors.extend((gm_id_pred_log - gt_gm_id_log).abs().cpu().tolist())
+
                     # MoE diagnostics: per-region errors and region head accuracy
                     region_probs = out_dict.get('mosfet_region_probs')
                     region_labels = getattr(batch, 'mosfet_region_labels', None)
@@ -752,6 +862,19 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
             total_vth_loss += vth_loss.float() * batch_size
         if dc_gain_loss_weight > 0:
             total_dc_gain_loss += dc_gain_loss.float() * batch_size
+            dc_pred = out_dict.get('dc_gain_pred')
+            if dc_pred is not None and hasattr(batch, 'ac_dc_gain'):
+                pred_db = dc_pred * dc_gain_std + dc_gain_mean
+                gt_db = batch.ac_dc_gain.to(device)
+                all_dc_gain_errors.extend((pred_db - gt_db).abs().cpu().tolist())
+        if gm_id_consistency_weight > 0:
+            total_gm_id_loss += gm_id_loss.float() * batch_size
+        if gm_id_aux_weight > 0:
+            total_gm_id_aux_loss += gm_id_aux_loss.float() * batch_size
+        if constraint_weight > 0 and mirror_pair_indices is not None and len(mirror_pair_indices) > 0:
+            total_hardcoded_mirror_loss += hardcoded_mirror_loss.float() * batch_size
+            for pname, ploss in batch_mirror_pair_losses.items():
+                total_mirror_pair_losses[pname] = total_mirror_pair_losses.get(pname, 0) + ploss * batch_size
 
         # Denormalize for error analysis — always use net-node predictions
         # for fair comparison across runs (regardless of terminal loss setting)
@@ -805,6 +928,10 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
     avg_vov_loss = (total_vov_loss / total_count).item() if vov_loss_weight > 0 else 0.0
     avg_vth_loss = (total_vth_loss / total_count).item() if vth_loss_weight > 0 else 0.0
     avg_dc_gain_loss = (total_dc_gain_loss / total_count).item() if dc_gain_loss_weight > 0 else 0.0
+    avg_gm_id_loss = (total_gm_id_loss / total_count).item() if gm_id_consistency_weight > 0 else 0.0
+    avg_gm_id_aux_loss = (total_gm_id_aux_loss / total_count).item() if gm_id_aux_weight > 0 else 0.0
+    avg_hardcoded_mirror_loss = (total_hardcoded_mirror_loss / total_count).item() if constraint_weight > 0 and mirror_pair_indices is not None and len(mirror_pair_indices) > 0 else 0.0
+    avg_mirror_pair_losses = {k: v / total_count for k, v in total_mirror_pair_losses.items()} if total_mirror_pair_losses else {}
 
     # Relative error metrics
     v_rel_median = float(np.median(all_rel_errors)) if len(all_rel_errors) > 0 else 0.0
@@ -852,8 +979,20 @@ def validate(model, loader, device, vdc_mean, vdc_std, current_mean, current_std
         'i_abs_acc': i_abs_acc,
         'ss_metrics': ss_metrics,
     }
+    if all_gm_id_rel:
+        gm_id_rel_arr = np.array(all_gm_id_rel)
+        gm_id_log_arr = np.array(all_gm_id_log_errors)
+        rel_metrics['gm_id_metrics'] = {
+            'acc': {t: float((gm_id_rel_arr < t).mean() * 100) for t in [10, 20, 50]},
+            'median_rel': float(np.median(gm_id_rel_arr)),
+            'log_mae': float(gm_id_log_arr.mean()),
+            'log_median': float(np.median(gm_id_log_arr)),
+        }
+    if all_dc_gain_errors:
+        dc_arr = np.array(all_dc_gain_errors)
+        rel_metrics['dc_gain_acc_3dB'] = float((dc_arr < 3).mean() * 100)
 
-    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics, avg_vov_loss, avg_vth_loss, avg_ac_component_losses, avg_dc_gain_loss
+    return avg_loss, mae_mv, avg_voltage_loss, avg_current_loss, current_mae_ua, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, avg_kcl_loss, avg_diff_pair_loss, avg_mirror_loss, avg_output_stage_loss, avg_lambda_mirror_loss, avg_gm_physics_loss, avg_ac_loss, avg_ss_gm_loss, avg_ss_gds_loss, avg_triode_physics_loss, avg_triode_eq1_loss, avg_triode_eq2_loss, avg_triode_eq3_loss, avg_cutoff_physics_loss, avg_region_loss, rel_metrics, avg_vov_loss, avg_vth_loss, avg_ac_component_losses, avg_dc_gain_loss, avg_gm_id_loss, avg_gm_id_aux_loss, avg_hardcoded_mirror_loss, avg_mirror_pair_losses
 
 
 def validate_simple(model, loader, device, vdc_mean, vdc_std, current_mean, current_std,

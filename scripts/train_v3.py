@@ -38,9 +38,12 @@ from src.training.data_loading import (
     add_region_node_targets,
     compute_ss_normalization,
     normalize_batches_ss,
+    compute_vov_normalization,
+    normalize_batches_vov,
 )
 from src.training.loops import train_epoch, validate
-from src.training.losses import compute_kcl_loss, compute_kcl_per_net_debug
+from src.training.losses import compute_kcl_loss, compute_kcl_per_net_debug, UncertaintyWeights
+from src.training.current_constraints import build_mirror_pair_indices, OPAMP_3STAGE_DEVICE_NAMES
 from src.training.scheduler import create_scheduler, apply_warmup, step_scheduler
 from src.training.plotting import plot_training_curves
 from src.training.checkpoint import save_checkpoint, build_full_config, create_model_from_args
@@ -100,10 +103,18 @@ def main():
                         help='Weight for KCL physics loss (0 = disabled)')
     parser.add_argument('--fast', action='store_true',
                         help='Fast mode: disable deterministic algorithms, enable cudnn.benchmark')
+    parser.add_argument('--deterministic', action='store_true',
+                        help='Full deterministic mode: forces all ops (scatter, atomics) to be deterministic. ~3x slower.')
+    parser.add_argument('--no-amp', action='store_true', dest='no_amp',
+                        help='Disable AMP (use FP32 instead of BF16)')
+    parser.add_argument('--amp', action='store_true',
+                        help='Force enable AMP (BF16)')
     parser.add_argument('--compile', action='store_true',
                         help='Use torch.compile() for model optimization (PyTorch 2.0+)')
     parser.add_argument('--name', type=str, default=None,
                         help='Experiment name (saves outputs to experiments/<name>/)')
+    parser.add_argument('--all-variants-per-epoch', action='store_true', dest='all_variants_per_epoch',
+                        help='Train on all variants per epoch instead of rotating (10x more steps/epoch)')
     args = parser.parse_args()
 
     # Track which CLI args were explicitly provided (for overriding config)
@@ -145,11 +156,16 @@ def main():
         torch.backends.cudnn.benchmark = True  # Auto-tune convolution algorithms
         torch.set_float32_matmul_precision('high')  # Use TensorCores
         print("Fast mode: cudnn.benchmark=True, deterministic=False")
-    else:
-        # Reproducible mode: exact results but slower
+    elif getattr(args, 'deterministic', False):
+        # Full deterministic mode: ALL ops deterministic (scatter, atomics, etc.)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True)
+        print("Full deterministic mode: use_deterministic_algorithms=True (~3x slower)")
+    else:
+        # Default: cudnn deterministic only (scatter ops remain non-deterministic)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     # Load dataset
     dataset_path = Path(args.dataset)
@@ -166,8 +182,16 @@ def main():
     else:
         output_path = dataset_path
 
-    # Tee stdout to a log file in the output directory (overwritten each run)
+    # Copy original config into experiment folder for reproducibility
     output_path.mkdir(parents=True, exist_ok=True)
+    if args.config:
+        import shutil
+        shutil.copy2(args.config, output_path / 'original_config.yaml')
+        # Append actual CLI overrides so the saved config reflects what ran
+        with open(output_path / 'original_config.yaml', 'a') as f:
+            f.write(f"\n# CLI overrides: seed={args.seed}\n")
+
+    # Tee stdout to a log file in the output directory (overwritten each run)
     log_file = open(output_path / 'training.log', 'w')
     class Tee:
         def __init__(self, *streams):
@@ -191,6 +215,9 @@ def main():
     current_mean, current_std = 0.0, 1.0
     ss_gm_mean, ss_gm_std = 0.0, 1.0
     ss_gds_mean, ss_gds_std = 0.0, 1.0
+    ss_region_stats = None
+    gm_id_mean, gm_id_std = 0.0, 1.0
+    vov_mean, vov_std = 0.0, 1.0
     has_ss = False
     variant_config = {'enabled': False}
 
@@ -270,13 +297,63 @@ def main():
 
         # Normalize SS targets (log10 gm/gds) with z-score
         has_ss = any(hasattr(b, 'mosfet_drain_mask') and b.mosfet_drain_mask.any() for b in train_batches[:3])
+        ss_region_stats = None
         if has_ss:
-            ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std = compute_ss_normalization(all_train_variants)
-            print(f"SS normalization: gm mean={ss_gm_mean:.2f}, std={ss_gm_std:.2f} | gds mean={ss_gds_mean:.2f}, std={ss_gds_std:.2f}")
+            ss_per_region = getattr(args, 'ss_per_region_norm', False)
+            if ss_per_region:
+                ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std, ss_region_stats = compute_ss_normalization(all_train_variants, per_region=True)
+                print(f"SS normalization (per-region):")
+                print(f"  global: gm mean={ss_gm_mean:.2f}, std={ss_gm_std:.2f} | gds mean={ss_gds_mean:.2f}, std={ss_gds_std:.2f}")
+                for r, name in enumerate(['cutoff', 'triode', 'saturation']):
+                    s = ss_region_stats[r]
+                    print(f"  {name}: gm mean={s['gm_mean']:.2f} std={s['gm_std']:.2f} | gds mean={s['gds_mean']:.2f} std={s['gds_std']:.2f}")
+            else:
+                ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std = compute_ss_normalization(all_train_variants)
+                print(f"SS normalization: gm mean={ss_gm_mean:.2f}, std={ss_gm_std:.2f} | gds mean={ss_gds_mean:.2f}, std={ss_gds_std:.2f}")
             for variant_batches in all_train_variants:
-                normalize_batches_ss(variant_batches, ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std)
+                normalize_batches_ss(variant_batches, ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std, region_stats=ss_region_stats)
             if val_batches:
-                normalize_batches_ss(val_batches, ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std)
+                normalize_batches_ss(val_batches, ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std, region_stats=ss_region_stats)
+
+        # Compute gm/Id normalization (log10 z-score)
+        ss_predict_gm_id = getattr(args, 'ss_head_config', {}).get('predict_gm_id', False)
+        if (getattr(args, 'gm_id_aux_weight', 0.0) > 0 or ss_predict_gm_id) and has_ss:
+            gm_id_vals = []
+            for b in train_batches:
+                gm = b.mosfet_gm if hasattr(b, 'mosfet_gm') else None
+                if gm is not None:
+                    valid = gm > 1e-12
+                    if valid.any():
+                        mi = b.mosfet_info.long()
+                        num_m = mi.shape[0]
+                        num_g = b.ptr.shape[0] - 1
+                        mp = getattr(b, 'mosfet_ptr', None)
+                        dev = mi.device
+                        if mp is not None:
+                            mg = torch.bucketize(torch.arange(num_m, device=dev), mp[1:].to(dev), right=True)
+                        else:
+                            mg = torch.arange(num_m, device=dev) // (num_m // num_g)
+                        offs = b.ptr.to(dev)[mg]
+                        drain_idx = mi[:, 1] + offs
+                        log_gm = torch.log10(gm[valid].clamp(min=1e-20))
+                        log_id = b.node_current_targets[drain_idx[valid]] * current_std + current_mean
+                        gm_id_vals.append((log_gm - log_id).cpu())
+            if gm_id_vals:
+                all_gm_id = torch.cat(gm_id_vals)
+                gm_id_mean = all_gm_id.mean().item()
+                gm_id_std = all_gm_id.std().item()
+                print(f"gm/Id normalization: mean={gm_id_mean:.2f}, std={gm_id_std:.2f}")
+
+        # Normalize Vov targets (log10 z-score)
+        has_vov = any(hasattr(b, 'mosfet_gt_vov') and (b.mosfet_gt_vov > 0).any() for b in train_batches[:3])
+        vov_mean, vov_std = 0.0, 1.0
+        if has_vov:
+            vov_mean, vov_std = compute_vov_normalization(all_train_variants)
+            print(f"Vov normalization: log10 mean={vov_mean:.2f}, std={vov_std:.2f}")
+            for variant_batches in all_train_variants:
+                normalize_batches_vov(variant_batches, vov_mean, vov_std)
+            if val_batches:
+                normalize_batches_vov(val_batches, vov_mean, vov_std)
 
         train_loader = PrebatchedLoader(train_batches, shuffle=True)
         val_loader = PrebatchedLoader(val_batches, shuffle=False) if val_batches else None
@@ -334,6 +411,24 @@ def main():
             print(f"SS normalization: gm mean={ss_gm_mean:.2f}, std={ss_gm_std:.2f} | gds mean={ss_gds_mean:.2f}, std={ss_gds_std:.2f}")
             train_ds.normalize_ss(ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std)
             val_ds.normalize_ss(ss_gm_mean, ss_gm_std, ss_gds_mean, ss_gds_std)
+
+            # gm/Id normalization for fixed topology
+            if getattr(args, 'gm_id_aux_weight', 0.0) > 0:
+                mosfet_gm_all = train_ds.all_mosfet_gm  # [N_samples, M]
+                valid = mosfet_gm_all > 1e-12
+                log_gm = torch.log10(mosfet_gm_all[valid].clamp(min=1e-20))
+                # Get drain currents: mosfet_info[:,1] gives drain terminal indices
+                mi = train_ds.mosfet_info_fixed.long()
+                drain_idx = mi[:, 1]  # [M] per-graph drain indices
+                # all_node_current_targets: [N_samples, N_nodes] z-scored
+                drain_currents = train_ds.all_node_current_targets[:, drain_idx]  # [N_samples, M]
+                log_id = drain_currents[valid] * current_std + current_mean
+                gm_id_all = log_gm - log_id
+                gm_id_finite = gm_id_all[torch.isfinite(gm_id_all)]
+                gm_id_mean = gm_id_finite.mean().item()
+                gm_id_std = gm_id_finite.std().item()
+                if gm_id_std == 0: gm_id_std = 1.0
+                print(f"gm/Id normalization: mean={gm_id_mean:.2f}, std={gm_id_std:.2f}")
 
         ft_batch_size = getattr(args, 'batch_size', 1024)
         train_loader = FixedTopologyLoader(train_ds, batch_size=ft_batch_size, shuffle=True)
@@ -457,6 +552,7 @@ def main():
             'voltage_head_config', 'current_head_config', 'ss_head_config',
             'ac_head_config', 'region_head_config', 'mosfet_current_mlp_config',
             'current_gnn_config', 'frozen_device_mlp_config', 'refinement_config',
+            'vov_head_config',
         ]
         overridden = []
         for arg_name, cfg_keys in _arch_map.items():
@@ -512,6 +608,27 @@ def main():
     model, model_class = create_model_from_args(args, total_input_dim, args.device)
     print(f"Using {model_class}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # Set normalization stats for autograd gm/gds or physics DC gain (needed for denormalization)
+    _needs_norm_stats = getattr(model, '_needs_autograd', False) or \
+        (getattr(model, 'predict_dc_gain', False) and getattr(model, 'dc_gain_mode', '') == 'physics')
+    if _needs_norm_stats:
+        model.set_normalization_stats(
+            vdc_mean, vdc_std,
+            ss_gm_mean, ss_gm_std,
+            ss_gds_mean, ss_gds_std,
+            current_mean=current_mean, current_std=current_std,
+        )
+        _mode = 'autograd_ss' if getattr(model, 'use_autograd_ss', False) else \
+                'iv_model' if getattr(model, 'use_iv_model', False) else 'dc_gain_physics'
+        print(f"{_mode}: set normalization stats ("
+              f"gm: {ss_gm_mean:.2f}/{ss_gm_std:.2f}, gds: {ss_gds_mean:.2f}/{ss_gds_std:.2f})")
+
+    # Set gm/Id normalization stats if needed
+    if hasattr(model, 'ss_gm_id_mean_buf') and gm_id_mean != 0.0:
+        model.ss_gm_id_mean_buf.fill_(gm_id_mean)
+        model.ss_gm_id_std_buf.fill_(gm_id_std)
+        print(f"gm/Id normalization set on model: mean={gm_id_mean:.2f}, std={gm_id_std:.2f}")
 
     # torch.compile() for PyTorch 2.0+ optimization
     if getattr(args, 'compile', False):
@@ -608,14 +725,30 @@ def main():
         args._finetune_source = str(args.checkpoint)
         args._finetune_source_epoch = ckpt.get('epoch', -1)
 
+    # Uncertainty weighting (Kendall et al. 2018)
+    use_uncertainty_weighting = getattr(args, 'use_uncertainty_weighting', False)
+    uncertainty_weights = None
+    if use_uncertainty_weighting:
+        task_names = ['voltage', 'current']
+        if getattr(args, 'ss_gm_loss_weight', 0.0) > 0:
+            task_names.append('ss_gm')
+        if getattr(args, 'ss_gds_loss_weight', 0.0) > 0:
+            task_names.append('ss_gds')
+        if getattr(args, 'vov_loss_weight', 0.0) > 0:
+            task_names.append('vov')
+        uncertainty_weights = UncertaintyWeights(task_names).to(args.device)
+        print(f"Uncertainty weighting enabled for tasks: {task_names}")
+
     # Optimizer and scheduler (use only trainable params for Phase 2 / freeze-backbone)
     weight_decay = getattr(args, 'weight_decay', 0.0)
+    adam_eps = getattr(args, 'adam_eps', 1e-8)
     use_fused = torch.cuda.is_available()
+    uw_params = list(uncertainty_weights.parameters()) if uncertainty_weights is not None else []
 
     if getattr(args, 'phase2', False) or (getattr(args, 'finetune', False) and getattr(args, 'freeze_backbone', False)):
         # Only optimize trainable (unfrozen) parameters
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=weight_decay, fused=use_fused)
+        trainable_params = [p for p in model.parameters() if p.requires_grad] + uw_params
+        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=weight_decay, eps=adam_eps, fused=use_fused)
     elif getattr(args, 'finetune', False) and not getattr(args, 'freeze_backbone', False):
         # Discriminative LR: backbone gets lower LR, heads get full LR
         backbone_prefixes = ('layers.', 'jk_linear.', 'jk_attn.', 'input_proj.', 'input_linear.',
@@ -629,11 +762,11 @@ def main():
                 head_params.append(param)
         optimizer = torch.optim.Adam([
             {'params': backbone_params, 'lr': args.lr * args.backbone_lr_scale},
-            {'params': head_params, 'lr': args.lr},
-        ], weight_decay=weight_decay, fused=use_fused)
+            {'params': head_params + uw_params, 'lr': args.lr},
+        ], weight_decay=weight_decay, eps=adam_eps, fused=use_fused)
         print(f"Discriminative LR: backbone={args.lr * args.backbone_lr_scale:.2e}, heads={args.lr:.2e}")
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=weight_decay, fused=use_fused)
+        optimizer = torch.optim.Adam(list(model.parameters()) + uw_params, lr=args.lr, weight_decay=weight_decay, eps=adam_eps, fused=use_fused)
 
     scheduler = create_scheduler(
         optimizer, args.scheduler, args.epochs, args.warmup,
@@ -642,16 +775,22 @@ def main():
         plateau_patience=getattr(args, 'plateau_patience', 10)
     )
 
-    # AMP - use bfloat16 for better precision (less overflow issues than float16)
-    use_amp = args.device != 'cpu' and torch.cuda.is_available()
-    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else (torch.float16 if use_amp else None)
-    scaler = torch.amp.GradScaler('cuda') if amp_dtype == torch.float16 else None  # bfloat16 doesn't need scaler
-    if use_amp:
-        dtype_name = 'bfloat16' if amp_dtype == torch.bfloat16 else 'float16'
-        print(f"Using AMP with {dtype_name}")
+    # AMP default: disabled (FP32). Use --amp to force enable.
+    if getattr(args, 'amp', False):
+        use_amp = True
+        amp_dtype = torch.bfloat16
+        scaler = None  # bfloat16 doesn't need GradScaler
+        print("Using AMP (BF16) — forced via --amp flag")
+    else:
+        use_amp = False
+        amp_dtype = None
+        scaler = None
+        print("Using FP32 (AMP disabled)")
+
 
     # Training state
     best_val_loss, best_epoch = float('inf'), 0
+    best_composite_score = 0.0
     train_losses, val_losses, val_maes = [], [], []
     train_voltage_losses, val_voltage_losses = [], []
     train_current_losses, val_current_losses = [], []
@@ -659,11 +798,16 @@ def main():
     train_ss_gds_losses, val_ss_gds_losses = [], []
     train_kcl_losses, val_kcl_losses = [], []
     train_ac_losses, val_ac_losses = [], []
+    train_ac_component_losses = {}  # {comp: [epoch_losses]}
+    val_ac_component_losses = {}    # {comp: [epoch_losses]}
+    train_dc_gain_losses, val_dc_gain_losses = [], []
     train_region_losses, val_region_losses = [], []
+    max_grad_norms, avg_grad_norms = [], []
     train_gm_physics_losses, val_gm_physics_losses = [], []
     train_triode_physics_losses, val_triode_physics_losses = [], []
     train_cutoff_physics_losses, val_cutoff_physics_losses = [], []
     train_maes, train_current_maes, val_current_maes, learning_rates = [], [], [], []
+    train_hc_mirror_losses, val_hc_mirror_losses = [], []
     epochs_without_improvement = 0
     best_model_state = None
     best_metrics = {'val_mae_mv': float('inf'), 'val_current_mae_ua': 0.0, 'acc80': 0.0, 'acc50': 0.0, 'acc20': 0.0, 'acc10': 0.0, 'current_acc50': 0.0, 'current_acc20': 0.0, 'current_acc10': 0.0, 'current_acc5': 0.0, 'rel_metrics': None}
@@ -688,10 +832,34 @@ def main():
     kcl_skip_two_term = getattr(args, 'kcl_skip_two_term', False)
     kcl_only_two_term = getattr(args, 'kcl_only_two_term', False)
     kcl_intermediate_weight = getattr(args, 'kcl_intermediate_weight', 0.0)
+    vov_loss_weight = getattr(args, 'vov_loss_weight', 0.0)
+    vth_loss_weight = getattr(args, 'vth_loss_weight', 0.0)
     # Physics constraint config (diff pair, current mirrors)
     constraint_weight_target = getattr(args, 'constraint_weight', 0.0)
     constraint_warmup_epochs = getattr(args, 'constraint_warmup_epochs', 0)
     constraint_start_epoch_cfg = getattr(args, 'constraint_start_epoch', 0)
+
+    # Build hardcoded mirror pair indices (once at startup)
+    mirror_pair_indices, mirror_pair_ratios, mirror_pair_names = None, None, None
+    if constraint_weight_target > 0:
+        # Try to get device names from first batch, fallback to hardcoded 3-stage names
+        first_batch = next(iter(train_loader))
+        names = None
+        if hasattr(first_batch, 'mosfet_device_names') and first_batch.mosfet_device_names:
+            names = first_batch.mosfet_device_names
+            if isinstance(names[0], list):
+                names = names[0]
+        if names is None:
+            names = OPAMP_3STAGE_DEVICE_NAMES
+            print(f"Using hardcoded 3-stage device names ({len(names)} devices)")
+        mirror_pair_indices, mirror_pair_ratios, mirror_pair_names = build_mirror_pair_indices(names)
+        if len(mirror_pair_indices) > 0:
+            mirror_pair_indices = mirror_pair_indices.to(args.device)
+            mirror_pair_ratios = mirror_pair_ratios.to(args.device)
+            print(f"Mirror pairs: {len(mirror_pair_indices)} pairs — {', '.join(mirror_pair_names)}")
+        else:
+            print("Warning: No mirror pairs found in device names")
+            mirror_pair_indices = None
 
     # gm self-consistency physics loss config
     gm_physics_loss_weight_target = getattr(args, 'gm_physics_loss_weight', 0.0)
@@ -727,6 +895,12 @@ def main():
 
     # Device consistency loss config
     device_consistency_weight = getattr(args, 'device_consistency_weight', 0.0)
+
+    # DC gain prediction loss config
+    dc_gain_loss_weight_target = getattr(args, 'dc_gain_loss_weight', 0.0)
+    dc_gain_loss_weight = dc_gain_loss_weight_target
+    dc_gain_warmup_epochs = getattr(args, 'dc_gain_warmup_epochs', 0)
+    dc_gain_start_epoch = getattr(args, 'dc_gain_start_epoch', 0)
 
     # Region classification loss config
     region_loss_weight_target = getattr(args, 'region_loss_weight', 0.0)
@@ -782,9 +956,27 @@ def main():
             print("WARNING: No valid AC samples found. AC loss will be disabled.")
             ac_loss_weight_target = 0.0
 
+    # Compute DC gain normalization stats from training data (all samples)
+    dc_gain_mean = 0.0
+    dc_gain_std = 1.0
+    if dc_gain_loss_weight > 0:
+        dc_gain_vals = []
+        for batch in train_loader:
+            if hasattr(batch, 'ac_dc_gain'):
+                dc_gain_vals.extend(batch.ac_dc_gain.tolist())
+        if dc_gain_vals:
+            dc_gain_mean = float(np.mean(dc_gain_vals))
+            dc_gain_std = max(float(np.std(dc_gain_vals)), 1e-6)
+            print(f"DC gain normalization: mean={dc_gain_mean:.2f} dB, std={dc_gain_std:.2f} dB")
+            print(f"  ({len(dc_gain_vals)} samples)")
+        else:
+            print("WARNING: No dc_gain data found. DC gain loss will be disabled.")
+            dc_gain_loss_weight = 0.0
+
     # Stage 2 node weighting config
     stage2_weight = getattr(args, 'stage2_weight', 1.0)
     stage2_nodes = getattr(args, 'stage2_nodes', None)
+    node_weights = getattr(args, 'node_weights', None)
 
     # Terminal voltage supervision
     use_terminal_voltage_loss = getattr(args, 'use_terminal_voltage_loss', False)
@@ -792,12 +984,21 @@ def main():
         print("Terminal voltage supervision enabled (loss on terminal nodes)")
 
     training_start_time = time.time()
+
+    # All-variants-per-epoch mode: concatenate all variant batches into one loader
+    all_variants_per_epoch = getattr(args, 'all_variants_per_epoch', False)
+    if all_variants_per_epoch and variant_config['enabled']:
+        all_batches = [b for var in variant_config['all_train_variants'] for b in var]
+        train_loader = PrebatchedLoader(all_batches, shuffle=True)
+        print(f"All-variants-per-epoch: {len(all_batches)} batches/epoch "
+              f"(from {variant_config['num_variants']} variants)")
+
     print(f"\nTraining for {args.epochs} epochs (early stopping: patience={early_stopping_patience})...")
 
     pbar = tqdm(range(args.epochs), desc="Training")
     for epoch in pbar:
-        # Variant rotation
-        if variant_config['enabled'] and epoch > 0:
+        # Variant rotation (skip if using all variants per epoch)
+        if variant_config['enabled'] and epoch > 0 and not all_variants_per_epoch:
             variant_id = epoch % variant_config['num_variants']
             train_batches = variant_config['all_train_variants'][variant_id]
             train_loader = PrebatchedLoader(train_batches, shuffle=True)
@@ -907,10 +1108,27 @@ def main():
         else:
             cutoff_physics_loss_weight = cutoff_physics_loss_weight_target
 
+        # Apply DC gain loss warmup
+        dc_gain_start = dc_gain_start_epoch if dc_gain_start_epoch > 0 else 0
+        if dc_gain_warmup_epochs > 0 and epoch >= dc_gain_start:
+            dc_epoch = epoch - dc_gain_start
+            if dc_epoch < dc_gain_warmup_epochs:
+                dc_gain_loss_weight = dc_gain_loss_weight_target * (dc_epoch + 1) / dc_gain_warmup_epochs
+            else:
+                dc_gain_loss_weight = dc_gain_loss_weight_target
+        elif epoch < dc_gain_start:
+            dc_gain_loss_weight = 0.0
+        else:
+            dc_gain_loss_weight = dc_gain_loss_weight_target
+
         # Region loss: apply start_epoch
         region_loss_weight = region_loss_weight_target if epoch >= region_loss_start_epoch_cfg else 0.0
 
-        loss, mae_norm, voltage_loss, current_loss, current_mae_ua, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, cutoff_physics_loss, region_loss = train_epoch(
+        # Update current epoch for warmup-aware modules (e.g. loop attention)
+        if hasattr(model, 'current_epoch'):
+            model.current_epoch = epoch
+
+        loss, mae_norm, voltage_loss, current_loss, current_mae_ua, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, cutoff_physics_loss, region_loss, train_vov_loss, train_vth_loss, train_ac_comp, train_dc_gain_loss, max_grad_norm, avg_grad_norm, train_gm_id_loss, train_gm_id_aux_loss, train_hc_mirror_loss, train_mirror_pair_detail = train_epoch(
             model, train_loader, optimizer, args.gradient_clip, args.device, scaler,
             predict_currents=predict_currents, current_weight=current_weight,
             voltage_weight=getattr(args, 'voltage_weight', 1.0),
@@ -918,7 +1136,7 @@ def main():
             current_mean=current_mean, current_std=current_std, loss_type=loss_type, huber_delta=huber_delta,
             kcl_min_current=kcl_min_current, constraint_weight=constraint_weight, amp_dtype=amp_dtype,
             vdc_mean=vdc_mean, vdc_std=vdc_std,
-            stage2_nodes=stage2_nodes, stage2_weight=stage2_weight,
+            stage2_nodes=stage2_nodes, stage2_weight=stage2_weight, node_weights=node_weights,
             use_terminal_voltage_loss=use_terminal_voltage_loss,
             gm_physics_loss_weight=gm_physics_loss_weight, gm_physics_min_vov=gm_physics_min_vov, gm_physics_use_clm=gm_physics_use_clm,
             gm_physics_use_gt_voltages=gm_physics_use_gt_voltages,
@@ -926,6 +1144,8 @@ def main():
             ss_gds_mean=ss_gds_mean if has_ss else 0.0, ss_gds_std=ss_gds_std if has_ss else 1.0,
             ac_loss_weight=ac_loss_weight, ac_mean=ac_mean, ac_std=ac_std, ac_components=ac_components,
             ss_gm_loss_weight=ss_gm_loss_weight, ss_gds_loss_weight=ss_gds_loss_weight,
+            ss_huber_delta=getattr(args, 'ss_huber_delta', 0.0),
+            ss_region_stats=ss_region_stats,
             triode_physics_loss_weight=triode_physics_loss_weight, triode_physics_config=triode_physics_config,
             cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
             region_loss_weight=region_loss_weight,
@@ -941,6 +1161,20 @@ def main():
             device_consistency_weight=device_consistency_weight,
             intermediate_v_weight=getattr(args, 'intermediate_v_weight', 0.0),
             kcl_intermediate_weight=kcl_intermediate_weight,
+            vov_loss_weight=vov_loss_weight,
+            vth_loss_weight=vth_loss_weight,
+            uncertainty_weights=uncertainty_weights,
+            iv_id_loss_weight=getattr(args, 'iv_id_loss_weight', 0.0),
+            dc_gain_loss_weight=dc_gain_loss_weight,
+            dc_gain_mean=dc_gain_mean,
+            dc_gain_std=dc_gain_std,
+            gm_id_consistency_weight=getattr(args, 'gm_id_consistency_weight', 0.0),
+            gm_id_aux_weight=getattr(args, 'gm_id_aux_weight', 0.0),
+            gm_id_mean=gm_id_mean,
+            gm_id_std=gm_id_std,
+            mirror_pair_indices=mirror_pair_indices,
+            mirror_pair_ratios=mirror_pair_ratios,
+            mirror_pair_names=mirror_pair_names,
         )
 
         mae_mv = mae_norm * vdc_std * 1000
@@ -951,24 +1185,31 @@ def main():
         train_ss_gds_losses.append(ss_gds_loss)
         train_kcl_losses.append(kcl_loss)
         train_ac_losses.append(ac_loss)
+        for comp, comp_val in train_ac_comp.items():
+            train_ac_component_losses.setdefault(comp, []).append(comp_val)
+        train_dc_gain_losses.append(train_dc_gain_loss)
         train_region_losses.append(region_loss)
         train_gm_physics_losses.append(gm_physics_loss)
+        max_grad_norms.append(max_grad_norm)
+        avg_grad_norms.append(avg_grad_norm)
         train_triode_physics_losses.append(triode_physics_loss)
         train_cutoff_physics_losses.append(cutoff_physics_loss)
         train_maes.append(mae_mv)
         train_current_maes.append(current_mae_ua)
         learning_rates.append(optimizer.param_groups[0]['lr'])
+        train_hc_mirror_losses.append(train_hc_mirror_loss)
 
         # Validation
         if val_loader and epoch % val_freq == 0:
-            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_gm_loss, val_ss_gds_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss, val_rel_metrics = validate(
-                model, val_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
+            eval_model = model
+            val_loss, val_mae_mv, val_v_loss, val_c_loss, val_c_mae, acc80, acc50, acc20, acc10, current_acc50, current_acc20, current_acc10, current_acc5, val_kcl_loss, val_dp_loss, val_mirror_loss, val_os_loss, val_lm_loss, val_gm_physics_loss, val_ac_loss, val_ss_gm_loss, val_ss_gds_loss, val_triode_physics_loss, val_triode_eq1_loss, val_triode_eq2_loss, val_triode_eq3_loss, val_cutoff_physics_loss, val_region_loss, val_rel_metrics, val_vov_loss, val_vth_loss, val_ac_comp, val_dc_gain_loss, val_gm_id_loss, val_gm_id_aux_loss, val_hc_mirror_loss, val_mirror_pair_detail = validate(
+                eval_model, val_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                 predict_currents=predict_currents, current_weight=current_weight,
                 voltage_weight=getattr(args, 'voltage_weight', 1.0),
                 kcl_weight=kcl_weight,
                 loss_type=loss_type, huber_delta=huber_delta, kcl_min_current=kcl_min_current,
                 constraint_weight=constraint_weight,
-                stage2_nodes=stage2_nodes, stage2_weight=stage2_weight,
+                stage2_nodes=stage2_nodes, stage2_weight=stage2_weight, node_weights=node_weights,
                 use_terminal_voltage_loss=use_terminal_voltage_loss,
                 gm_physics_loss_weight=gm_physics_loss_weight, gm_physics_min_vov=gm_physics_min_vov, gm_physics_use_clm=gm_physics_use_clm,
                 gm_physics_use_gt_voltages=gm_physics_use_gt_voltages,
@@ -976,6 +1217,8 @@ def main():
                 ss_gds_mean=ss_gds_mean if has_ss else 0.0, ss_gds_std=ss_gds_std if has_ss else 1.0,
                 ac_loss_weight=ac_loss_weight, ac_mean=ac_mean, ac_std=ac_std, ac_components=ac_components,
                 ss_gm_loss_weight=ss_gm_loss_weight, ss_gds_loss_weight=ss_gds_loss_weight,
+                ss_huber_delta=getattr(args, 'ss_huber_delta', 0.0),
+                ss_region_stats=ss_region_stats,
                 triode_physics_loss_weight=triode_physics_loss_weight, triode_physics_config=triode_physics_config,
                 cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
                 region_loss_weight=region_loss_weight,
@@ -990,6 +1233,20 @@ def main():
                 kcl_only_two_term=kcl_only_two_term,
                 amp_dtype=amp_dtype,
                 device_consistency_weight=device_consistency_weight,
+                vov_loss_weight=vov_loss_weight,
+                vth_loss_weight=vth_loss_weight,
+                iv_id_loss_weight=getattr(args, 'iv_id_loss_weight', 0.0),
+                dc_gain_loss_weight=dc_gain_loss_weight,
+                dc_gain_mean=dc_gain_mean,
+                dc_gain_std=dc_gain_std,
+                gm_id_consistency_weight=getattr(args, 'gm_id_consistency_weight', 0.0),
+                gm_id_aux_weight=getattr(args, 'gm_id_aux_weight', 0.0),
+                gm_id_mean=gm_id_mean,
+                gm_id_std=gm_id_std,
+                mirror_pair_indices=mirror_pair_indices,
+                mirror_pair_ratios=mirror_pair_ratios,
+                mirror_pair_names=mirror_pair_names,
+                ac_pred_filter=getattr(args, 'ac_pred_filter', False),
             )
 
             val_losses.append(val_loss)
@@ -1000,16 +1257,42 @@ def main():
             val_ss_gds_losses.append(val_ss_gds_loss)
             val_kcl_losses.append(val_kcl_loss)
             val_ac_losses.append(val_ac_loss)
+            for comp, comp_val in val_ac_comp.items():
+                val_ac_component_losses.setdefault(comp, []).append(comp_val)
+            val_dc_gain_losses.append(val_dc_gain_loss)
             val_region_losses.append(val_region_loss)
             val_gm_physics_losses.append(val_gm_physics_loss)
             val_triode_physics_losses.append(val_triode_physics_loss)
             val_cutoff_physics_losses.append(val_cutoff_physics_loss)
             val_current_maes.append(val_c_mae)
+            val_hc_mirror_losses.append(val_hc_mirror_loss)
 
             if epoch >= args.warmup:
                 step_scheduler(scheduler, args.scheduler, val_loss)
 
-            if val_loss < best_val_loss - 1e-4:
+            # Compute composite score: V@5% + I@5% + gm@10% + gds@10%
+            composite_score = 0.0
+            use_composite = False
+            if val_rel_metrics:
+                vr = val_rel_metrics.get('v_rel_acc', {})
+                ir = val_rel_metrics.get('i_rel_acc', {})
+                ss = val_rel_metrics.get('ss_metrics') or {}
+                gm_acc = ss.get('gm_acc', {}).get(10, 0)
+                gds_acc = ss.get('gds_acc', {}).get(10, 0)
+                gm_id_m = val_rel_metrics.get('gm_id_metrics')
+                gm_id_acc = gm_id_m['acc'][10] if gm_id_m else 0
+                composite_score = vr.get(5, 0) + ir.get(5, 0) + gm_acc + gds_acc + gm_id_acc
+                if dc_gain_loss_weight > 0:
+                    composite_score += val_rel_metrics.get('dc_gain_acc_3dB', 0)
+                use_composite = composite_score > 0
+
+            if use_composite:
+                improved = composite_score > best_composite_score + 0.1
+            else:
+                improved = val_loss < best_val_loss - 1e-4
+
+            if improved:
+                best_composite_score = max(best_composite_score, composite_score)
                 best_val_loss, best_epoch = val_loss, epoch
                 best_model_state = model.state_dict()
                 epochs_without_improvement = 0
@@ -1020,7 +1303,7 @@ def main():
                 epochs_without_improvement += 1
 
             lr = optimizer.param_groups[0]['lr']
-            postfix = {'loss': f'{loss:.4f}', 'v_mae': f'{mae_mv:.1f}mV', 'lr': f'{lr:.2e}'}
+            postfix = {'loss': f'{loss:.4f}', 'v_mae': f'{mae_mv:.1f}mV', 'lr': f'{lr:.2e}', 'score': f'{composite_score:.1f}'}
             if predict_currents:
                 postfix['i_mae'] = f'{current_mae_ua:.1f}µA'
             if predict_currents:
@@ -1045,42 +1328,76 @@ def main():
             pbar.set_postfix(postfix)
 
             # Detailed progress every 50 epochs
-            if epoch > 0 and epoch % 50 == 0:
-                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_gm_loss, tr_ss_gds_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss, _tr_rel_metrics = validate(
+            detail_interval = 50
+            if epoch > 0 and epoch % detail_interval == 0:
+                tr_loss, tr_mae_mv, tr_v_loss, tr_c_loss, tr_c_mae, tr_acc80, tr_acc50, tr_acc20, tr_acc10, tr_current_acc50, tr_current_acc20, tr_current_acc10, tr_current_acc5, tr_kcl_loss, tr_dp_loss, tr_mirror_loss, tr_os_loss, tr_lm_loss, tr_gm_physics_loss, tr_ac_loss, tr_ss_gm_loss, tr_ss_gds_loss, tr_triode_physics_loss, tr_triode_eq1, tr_triode_eq2, tr_triode_eq3, tr_cutoff_physics_loss, tr_region_loss, _tr_rel_metrics, _tr_vov_loss, _tr_vth_loss, tr_ac_comp_detail, tr_dc_gain_loss, _tr_gm_id_loss, _tr_gm_id_aux_loss, tr_hc_mirror, tr_mirror_pair_detail = validate(
                     model, train_loader, args.device, vdc_mean, vdc_std, current_mean, current_std,
                     predict_currents=predict_currents, current_weight=current_weight,
                     voltage_weight=getattr(args, 'voltage_weight', 1.0),
                     kcl_weight=kcl_weight,
                     loss_type=loss_type, huber_delta=huber_delta, constraint_weight=constraint_weight,
-                    stage2_nodes=stage2_nodes, stage2_weight=stage2_weight,
+                    stage2_nodes=stage2_nodes, stage2_weight=stage2_weight, node_weights=node_weights,
                     use_terminal_voltage_loss=use_terminal_voltage_loss,
                     gm_physics_loss_weight=gm_physics_loss_weight, gm_physics_min_vov=gm_physics_min_vov, gm_physics_use_clm=gm_physics_use_clm,
                     ss_gm_mean=ss_gm_mean if has_ss else 0.0, ss_gm_std=ss_gm_std if has_ss else 1.0,
                     ss_gds_mean=ss_gds_mean if has_ss else 0.0, ss_gds_std=ss_gds_std if has_ss else 1.0,
                     ac_loss_weight=ac_loss_weight, ac_mean=ac_mean, ac_std=ac_std, ac_components=ac_components,
                     ss_gm_loss_weight=ss_gm_loss_weight, ss_gds_loss_weight=ss_gds_loss_weight,
+                    ss_huber_delta=getattr(args, 'ss_huber_delta', 0.0),
+                    ss_region_stats=ss_region_stats,
                     triode_physics_loss_weight=triode_physics_loss_weight, triode_physics_config=triode_physics_config,
                     cutoff_physics_loss_weight=cutoff_physics_loss_weight, cutoff_physics_n_nmos=cutoff_physics_n_nmos, cutoff_physics_n_pmos=cutoff_physics_n_pmos,
                     region_loss_weight=region_loss_weight,
                     amp_dtype=amp_dtype,
                     device_consistency_weight=device_consistency_weight,
+                    vov_loss_weight=vov_loss_weight,
+                    vth_loss_weight=vth_loss_weight,
+                    iv_id_loss_weight=getattr(args, 'iv_id_loss_weight', 0.0),
+                    dc_gain_loss_weight=dc_gain_loss_weight,
+                    dc_gain_mean=dc_gain_mean,
+                    dc_gain_std=dc_gain_std,
+                    gm_id_consistency_weight=getattr(args, 'gm_id_consistency_weight', 0.0),
+                    gm_id_aux_weight=getattr(args, 'gm_id_aux_weight', 0.0),
+                    gm_id_mean=gm_id_mean,
+                    gm_id_std=gm_id_std,
+                    mirror_pair_indices=mirror_pair_indices,
+                    mirror_pair_ratios=mirror_pair_ratios,
+                    mirror_pair_names=mirror_pair_names,
+                    ac_pred_filter=getattr(args, 'ac_pred_filter', False),
                 )
                 # Build rows dynamically: (label, train_value, val_value)
                 rows = []
                 rows.append(("Voltage", f"Loss={tr_v_loss:.4f}  MAE={tr_mae_mv:.1f}mV", f"Loss={val_v_loss:.4f}  MAE={val_mae_mv:.1f}mV"))
                 rows.append(("  Acc", f"@80={tr_acc80:.0f}% @50={tr_acc50:.0f}% @20={tr_acc20:.0f}% @10={tr_acc10:.0f}%", f"@80={acc80:.0f}% @50={acc50:.0f}% @20={acc20:.0f}% @10={acc10:.0f}%"))
+                # Relative voltage accuracy @1%
+                if _tr_rel_metrics and val_rel_metrics:
+                    tr_vr = _tr_rel_metrics.get('v_rel_acc', {})
+                    vl_vr = val_rel_metrics.get('v_rel_acc', {})
+                    if tr_vr and vl_vr:
+                        rows.append(("  RelAcc", f"@1%={tr_vr[1]:.1f}% @5%={tr_vr[5]:.1f}% @10%={tr_vr[10]:.1f}%", f"@1%={vl_vr[1]:.1f}% @5%={vl_vr[5]:.1f}% @10%={vl_vr[10]:.1f}%"))
                 if predict_currents:
                     rows.append(("Current", f"Loss={tr_c_loss:.5f}  MAE={tr_c_mae:.1f}uA", f"Loss={val_c_loss:.5f}  MAE={val_c_mae:.1f}uA"))
                     rows.append(("  Acc", f"@50%={tr_current_acc50:.0f}% @20%={tr_current_acc20:.0f}% @10%={tr_current_acc10:.0f}% @5%={tr_current_acc5:.0f}%", f"@50%={current_acc50:.0f}% @20%={current_acc20:.0f}% @10%={current_acc10:.0f}% @5%={current_acc5:.0f}%"))
+                    # Relative current accuracy @1%
+                    if _tr_rel_metrics and val_rel_metrics:
+                        tr_ir = _tr_rel_metrics.get('i_rel_acc', {})
+                        vl_ir = val_rel_metrics.get('i_rel_acc', {})
+                        if tr_ir and vl_ir:
+                            rows.append(("  RelAcc", f"@1%={tr_ir[1]:.1f}% @5%={tr_ir[5]:.1f}% @10%={tr_ir[10]:.1f}%", f"@1%={vl_ir[1]:.1f}% @5%={vl_ir[5]:.1f}% @10%={vl_ir[10]:.1f}%"))
                 if predict_currents:
                     rows.append(("KCL", f"{tr_kcl_loss:.2e}", f"{val_kcl_loss:.2e}"))
                     # KCL diagnostics: per-component breakdown, GT floor, drop stats
                     try:
+                        _use_iv = getattr(model, '_needs_autograd', False)
                         with torch.no_grad():
                             _vb = next(iter(val_loader))
                             if hasattr(_vb, 'to'):
                                 _vb = _vb.to(args.device)
-                            _out = model(_vb)
+                            if _use_iv:
+                                with torch.enable_grad():
+                                    _out = model(_vb)
+                            else:
+                                _out = model(_vb)
                             _kcl_args = dict(
                                 node_currents=_out['node_currents'],
                                 edge_index=_vb.edge_index,
@@ -1126,11 +1443,16 @@ def main():
                     # SS accuracy on train and val
                     def _eval_ss(loader):
                         _gm_e, _gds_e, _gm_rel, _gds_rel = [], [], [], []
+                        _use_iv = getattr(model, '_needs_autograd', False)
                         with torch.no_grad():
                             for _b in loader:
                                 if hasattr(_b, 'to'):
                                     _b = _b.to(args.device)
-                                _out = model(_b)
+                                if _use_iv:
+                                    with torch.enable_grad():
+                                        _out = model(_b)
+                                else:
+                                    _out = model(_b)
                                 _gm_p, _gds_p = _out.get('mosfet_gm_pred'), _out.get('mosfet_gds_pred')
                                 if _gm_p is None: break
                                 _mosfet_gm = getattr(_b, 'mosfet_gm', None)
@@ -1153,8 +1475,75 @@ def main():
                     if _vl_gm is not None:
                         rows.append(("  gm", f"MAE={_tr_gm.mean():.3f}log  <10%={100*np.mean(_tr_gm_r<10):.0f}%  <20%={100*np.mean(_tr_gm_r<20):.0f}%  <50%={100*np.mean(_tr_gm_r<50):.0f}%", f"MAE={_vl_gm.mean():.3f}log  <10%={100*np.mean(_vl_gm_r<10):.0f}%  <20%={100*np.mean(_vl_gm_r<20):.0f}%  <50%={100*np.mean(_vl_gm_r<50):.0f}%"))
                         rows.append(("  gds", f"MAE={_tr_gds.mean():.3f}log  <10%={100*np.mean(_tr_gds_r<10):.0f}%  <20%={100*np.mean(_tr_gds_r<20):.0f}%  <50%={100*np.mean(_tr_gds_r<50):.0f}%", f"MAE={_vl_gds.mean():.3f}log  <10%={100*np.mean(_vl_gds_r<10):.0f}%  <20%={100*np.mean(_vl_gds_r<20):.0f}%  <50%={100*np.mean(_vl_gds_r<50):.0f}%"))
+                # gm/Id accuracy (when predict_gm_id mode or aux head)
+                if getattr(args, 'gm_id_aux_weight', 0.0) > 0:
+                    def _eval_gm_id(loader):
+                        _errs, _rel = [], []
+                        with torch.no_grad():
+                            for _b in loader:
+                                if hasattr(_b, 'to'):
+                                    _b = _b.to(args.device)
+                                _out = model(_b)
+                                _gm_id_p = _out.get('mosfet_gm_id_pred')
+                                if _gm_id_p is None: break
+                                _mosfet_gm = getattr(_b, 'mosfet_gm', None)
+                                if _mosfet_gm is None: break
+                                _valid = _mosfet_gm.to(args.device) > 1e-12
+                                if _valid.any():
+                                    _pred_log = _gm_id_p[_valid] * gm_id_std + gm_id_mean
+                                    _mi = _b.mosfet_info.long()
+                                    _nm = _mi.shape[0]; _ng = _b.ptr.shape[0] - 1
+                                    _mp = getattr(_b, 'mosfet_ptr', None)
+                                    if _mp is not None:
+                                        _mg = torch.bucketize(torch.arange(_nm, device=args.device), _mp[1:].to(args.device), right=True)
+                                    else:
+                                        _mg = torch.arange(_nm, device=args.device) // (_nm // _ng)
+                                    _offs = _b.ptr.to(args.device)[_mg]
+                                    _gt_log_gm = torch.log10(_mosfet_gm.to(args.device)[_valid].clamp(min=1e-20))
+                                    _gt_log_id = _b.node_current_targets.to(args.device)[_mi[:, 1] + _offs] * current_std + current_mean
+                                    _gt = _gt_log_gm - _gt_log_id[_valid]
+                                    _errs.extend((_pred_log - _gt).abs().cpu().tolist())
+                                    _rel.extend(((10**_pred_log - 10**_gt).abs() / (10**_gt).clamp(min=1e-15) * 100).cpu().tolist())
+                        return np.array(_errs) if _errs else None, np.array(_rel) if _rel else None
+                    _tr_gmid, _tr_gmid_r = _eval_gm_id(train_loader)
+                    _vl_gmid, _vl_gmid_r = _eval_gm_id(val_loader)
+                    if _vl_gmid is not None:
+                        rows.append(("  gm/Id", f"MAE={_tr_gmid.mean():.3f}log  <10%={100*np.mean(_tr_gmid_r<10):.0f}%  <20%={100*np.mean(_tr_gmid_r<20):.0f}%  <50%={100*np.mean(_tr_gmid_r<50):.0f}%",
+                                               f"MAE={_vl_gmid.mean():.3f}log  <10%={100*np.mean(_vl_gmid_r<10):.0f}%  <20%={100*np.mean(_vl_gmid_r<20):.0f}%  <50%={100*np.mean(_vl_gmid_r<50):.0f}%"))
+
+                    # IV model drain current accuracy (if separate IV model active)
+                    if getattr(model, 'use_iv_model', False):
+                        def _eval_iv_id(loader):
+                            _id_errs = []
+                            with torch.no_grad():
+                                for _b in loader:
+                                    if hasattr(_b, 'to'):
+                                        _b = _b.to(args.device)
+                                    with torch.enable_grad():
+                                        _out = model(_b)
+                                    _iv_log_id = _out.get('mosfet_iv_log_abs_id')
+                                    if _iv_log_id is None: break
+                                    _mi = _b.mosfet_info
+                                    _ptr = _b.ptr
+                                    _mptr = getattr(_b, 'mosfet_ptr', None)
+                                    if _mptr is not None:
+                                        _offsets = _ptr[:-1].repeat_interleave(_mptr[1:] - _mptr[:-1])
+                                    else:
+                                        _n_graphs = len(_ptr) - 1
+                                        _offsets = _ptr[:-1].repeat_interleave(len(_mi) // _n_graphs)
+                                    _drain_idx = _mi[:, 1].long() + _offsets
+                                    _gt_zscore = _b.node_current_targets[_drain_idx]
+                                    _gt_log_id = _gt_zscore * current_std + current_mean
+                                    _valid = torch.isfinite(_gt_log_id) & (_gt_log_id > -15)
+                                    if _valid.any():
+                                        _id_errs.extend((_iv_log_id[_valid] - _gt_log_id[_valid].to(_iv_log_id.device)).abs().cpu().tolist())
+                            return np.array(_id_errs) if _id_errs else None
+                        _tr_id = _eval_iv_id(train_loader)
+                        _vl_id = _eval_iv_id(val_loader)
+                        if _vl_id is not None:
+                            rows.append(("  IV_ID", f"MAE={_tr_id.mean():.3f}log", f"MAE={_vl_id.mean():.3f}log"))
                 if gm_physics_loss_weight > 0:
-                    rows.append(("GmPhy", f"{tr_gm_physics_loss:.2e}", f"{val_gm_physics_loss:.2e}"))
+                    rows.append(("GmPhy", f"{gm_physics_loss:.2e}", f"{val_gm_physics_loss:.2e}"))
                 if triode_physics_loss_weight > 0:
                     rows.append(("TriPhy", f"{tr_triode_physics_loss:.2e}", f"{val_triode_physics_loss:.2e}"))
                     rows.append(("  eq1gm", f"{tr_triode_eq1:.2e}", f"{val_triode_eq1_loss:.2e}"))
@@ -1167,18 +1556,31 @@ def main():
                     # Quick region accuracy on train and val
                     def _eval_region(loader):
                         _preds, _labels = [], []
+                        _use_iv = getattr(model, '_needs_autograd', False)
                         with torch.no_grad():
                             for _b in loader:
                                 if hasattr(_b, 'to'):
                                     _b = _b.to(args.device)
-                                _out = model(_b)
+                                if _use_iv:
+                                    with torch.enable_grad():
+                                        _out = model(_b)
+                                else:
+                                    _out = model(_b)
                                 _rpred = _out.get('mosfet_region_pred')
-                                if _rpred is None: break
-                                _m = _b.mosfet_drain_mask & (_b.node_region_labels >= 0)
-                                if _m.any():
-                                    # Ordinal: <0.5 → cutoff(0), 0.5-1.5 → triode(1), >1.5 → sat(2)
-                                    _preds.append(_rpred[_m].round().clamp(0, 2).long().cpu())
-                                    _labels.append(_b.node_region_labels[_m].cpu())
+                                _rprobs = _out.get('mosfet_region_probs')
+                                if _rpred is None and _rprobs is None: break
+                                if _rprobs is not None:
+                                    # CORAL: use region probs argmax
+                                    _rlabels = getattr(_b, 'mosfet_region_labels', None)
+                                    if _rlabels is not None:
+                                        _preds.append(_rprobs.argmax(dim=-1).cpu())
+                                        _labels.append(_rlabels.cpu())
+                                elif _rpred is not None:
+                                    _m = _b.mosfet_drain_mask & (_b.node_region_labels >= 0)
+                                    if _m.any():
+                                        # Ordinal: <0.5 → cutoff(0), 0.5-1.5 → triode(1), >1.5 → sat(2)
+                                        _preds.append(_rpred[_m].round().clamp(0, 2).long().cpu())
+                                        _labels.append(_b.node_region_labels[_m].cpu())
                         if not _preds: return None
                         _p = torch.cat(_preds); _l = torch.cat(_labels)
                         _acc = 100 * (_p == _l).float().mean().item()
@@ -1193,16 +1595,24 @@ def main():
                         rows.append(("", f"Acc={_tr_r[0]:.0f}%  cut={_tr_r[1][0]:.0f}% tri={_tr_r[1][1]:.0f}% sat={_tr_r[1][2]:.0f}%",
                                         f"Acc={_vl_r[0]:.0f}%  cut={_vl_r[1][0]:.0f}% tri={_vl_r[1][1]:.0f}% sat={_vl_r[1][2]:.0f}%"))
                 if ac_loss_weight > 0:
-                    rows.append(("AC", f"{tr_ac_loss:.2e}", f"{val_ac_loss:.2e}"))
+                    # Show per-component AC losses
+                    ac_tr_parts = "  ".join(f"{c}={tr_ac_comp_detail.get(c, 0):.2e}" for c in ac_components)
+                    ac_vl_parts = "  ".join(f"{c}={val_ac_comp.get(c, 0):.2e}" for c in ac_components)
+                    rows.append(("AC", f"{tr_ac_loss:.2e}  ({ac_tr_parts})", f"{val_ac_loss:.2e}  ({ac_vl_parts})"))
                     # AC accuracy on train and val
                     def _eval_ac(loader):
                         _errs = {c: [] for c in ac_components}
                         _ugbw_rel = []
+                        _use_iv = getattr(model, '_needs_autograd', False)
                         with torch.no_grad():
                             for _b in loader:
                                 if hasattr(_b, 'to'):
                                     _b = _b.to(args.device)
-                                _out = model(_b)
+                                if _use_iv:
+                                    with torch.enable_grad():
+                                        _out = model(_b)
+                                else:
+                                    _out = model(_b)
                                 _ac_p = _out.get('ac_pred')
                                 if _ac_p is None: break
                                 _v = _b.ac_valid if hasattr(_b, 'ac_valid') else None
@@ -1225,27 +1635,84 @@ def main():
                             _te, _ve = _tr_ac.get(_c, _vl_ac[_c]), _vl_ac[_c]
                             if _c == 'ugbw':
                                 _tr_ur = _tr_ugbw_rel if _tr_ugbw_rel is not None else _vl_ugbw_rel
-                                rows.append(("  UGBW", f"MAE={_te.mean():.3f}log  <10%={100*np.mean(_tr_ur<10):.0f}%  <20%={100*np.mean(_tr_ur<20):.0f}%  <50%={100*np.mean(_tr_ur<50):.0f}%", f"MAE={_ve.mean():.3f}log  <10%={100*np.mean(_vl_ugbw_rel<10):.0f}%  <20%={100*np.mean(_vl_ugbw_rel<20):.0f}%  <50%={100*np.mean(_vl_ugbw_rel<50):.0f}%"))
+                                rows.append(("  UGBW", f"MAE={_te.mean():.3f}log  <5%={100*np.mean(_tr_ur<5):.0f}%  <10%={100*np.mean(_tr_ur<10):.0f}%  <20%={100*np.mean(_tr_ur<20):.0f}%", f"MAE={_ve.mean():.3f}log  <5%={100*np.mean(_vl_ugbw_rel<5):.0f}%  <10%={100*np.mean(_vl_ugbw_rel<10):.0f}%  <20%={100*np.mean(_vl_ugbw_rel<20):.0f}%"))
                             elif _c == 'pm':
-                                rows.append(("  PM", f"MAE={_te.mean():.1f}d  <5={100*np.mean(_te<5):.0f}%  <10={100*np.mean(_te<10):.0f}%", f"MAE={_ve.mean():.1f}d  <5={100*np.mean(_ve<5):.0f}%  <10={100*np.mean(_ve<10):.0f}%"))
+                                rows.append(("  PM", f"MAE={_te.mean():.1f}d  <5={100*np.mean(_te<5):.0f}%  <10={100*np.mean(_te<10):.0f}%  <20={100*np.mean(_te<20):.0f}%", f"MAE={_ve.mean():.1f}d  <5={100*np.mean(_ve<5):.0f}%  <10={100*np.mean(_ve<10):.0f}%  <20={100*np.mean(_ve<20):.0f}%"))
                             elif _c == 'am':
-                                rows.append(("  AM", f"MAE={_te.mean():.1f}dB  <3={100*np.mean(_te<3):.0f}%  <6={100*np.mean(_te<6):.0f}%", f"MAE={_ve.mean():.1f}dB  <3={100*np.mean(_ve<3):.0f}%  <6={100*np.mean(_ve<6):.0f}%"))
+                                rows.append(("  AM", f"MAE={_te.mean():.1f}dB  <1={100*np.mean(_te<1):.0f}%  <3={100*np.mean(_te<3):.0f}%  <5={100*np.mean(_te<5):.0f}%", f"MAE={_ve.mean():.1f}dB  <1={100*np.mean(_ve<1):.0f}%  <3={100*np.mean(_ve<3):.0f}%  <5={100*np.mean(_ve<5):.0f}%"))
+                if dc_gain_loss_weight > 0:
+                    rows.append(("DCGain", f"Loss={tr_dc_gain_loss:.2e}", f"Loss={val_dc_gain_loss:.2e}"))
+                    # Compute DC gain accuracy metrics
+                    def _eval_dc_gain(loader):
+                        _errs = []
+                        _use_iv = getattr(model, '_needs_autograd', False)
+                        with torch.no_grad():
+                            for _b in loader:
+                                if hasattr(_b, 'to'):
+                                    _b = _b.to(args.device)
+                                if _use_iv:
+                                    with torch.enable_grad():
+                                        _out = model(_b)
+                                else:
+                                    _out = model(_b)
+                                _dc_p = _out.get('dc_gain_pred')
+                                if _dc_p is None: break
+                                _dc_t = _b.ac_dc_gain.to(args.device)
+                                # Denormalize
+                                _pred_db = _dc_p * dc_gain_std + dc_gain_mean
+                                _errs.extend((_pred_db - _dc_t).abs().cpu().tolist())
+                        return np.array(_errs) if _errs else None
+                    _tr_dc = _eval_dc_gain(train_loader)
+                    _vl_dc = _eval_dc_gain(val_loader)
+                    if _tr_dc is not None and _vl_dc is not None:
+                        rows.append(("  Acc", f"MAE={_tr_dc.mean():.1f}dB  <3={100*np.mean(_tr_dc<3):.0f}%  <5={100*np.mean(_tr_dc<5):.0f}%  <10={100*np.mean(_tr_dc<10):.0f}%",
+                                            f"MAE={_vl_dc.mean():.1f}dB  <3={100*np.mean(_vl_dc<3):.0f}%  <5={100*np.mean(_vl_dc<5):.0f}%  <10={100*np.mean(_vl_dc<10):.0f}%"))
+                if vth_loss_weight > 0:
+                    rows.append(("Vth", f"{train_vth_loss:.2e}", f"{val_vth_loss:.2e}"))
                 if constraint_weight > 0:
-                    rows.append(("DiffPr", f"{tr_dp_loss:.2e}", f"{val_dp_loss:.2e}"))
-                    rows.append(("Mirror", f"{tr_mirror_loss:.2e}", f"{val_mirror_loss:.2e}"))
-                    rows.append(("OutStg", f"{tr_os_loss:.2e}", f"{val_os_loss:.2e}"))
-                    rows.append(("LamMir", f"{tr_lm_loss:.2e}", f"{val_lm_loss:.2e}"))
+                    if tr_dp_loss > 0 or val_dp_loss > 0:
+                        rows.append(("DiffPr", f"{tr_dp_loss:.2e}", f"{val_dp_loss:.2e}"))
+                    if tr_mirror_loss > 0 or val_mirror_loss > 0:
+                        rows.append(("Mirror", f"{tr_mirror_loss:.2e}", f"{val_mirror_loss:.2e}"))
+                    if tr_os_loss > 0 or val_os_loss > 0:
+                        rows.append(("OutStg", f"{tr_os_loss:.2e}", f"{val_os_loss:.2e}"))
+                    if tr_lm_loss > 0 or val_lm_loss > 0:
+                        rows.append(("LamMir", f"{tr_lm_loss:.2e}", f"{val_lm_loss:.2e}"))
+                    if mirror_pair_indices is not None and len(mirror_pair_indices) > 0:
+                        rows.append(("HCMirr", f"{tr_hc_mirror:.2e}", f"{val_hc_mirror_loss:.2e}"))
 
                 # Print with dynamic alignment
                 label_w = max(len(r[0]) for r in rows)
                 tr_w = max(len(r[1]) for r in rows)
-                print(f"\nEpoch {epoch:3d} | LR={lr:.2e} | BestLoss={best_val_loss:.4f}")
+                print(f"\nEpoch {epoch:3d} | LR={lr:.2e} | BestLoss={best_val_loss:.4f} | Score={composite_score:.1f} (best={best_composite_score:.1f}, ep={best_epoch}) | GradNorm max={max_grad_norm:.2f} avg={avg_grad_norm:.2f}")
                 print(f"  {'':>{label_w}}   {'Train':^{tr_w}} | {'Val'}")
                 for label, tr_val, val_val in rows:
                     print(f"  {label:>{label_w}}   {tr_val:<{tr_w}} | {val_val}")
                 tr_total = f"Loss={tr_loss:.4f}"
                 val_total = f"Loss={val_loss:.4f}"
                 print(f"  {'Total':>{label_w}}   {tr_total:<{tr_w}} | {val_total}")
+                # Mirror per-pair detail (printed outside table to avoid column stretching)
+                if constraint_weight > 0 and mirror_pair_indices is not None and len(mirror_pair_indices) > 0:
+                    if val_mirror_pair_detail:
+                        print(f"  Mirror pairs (val): {' '.join(f'{k}:{v:.2e}' for k, v in val_mirror_pair_detail.items())}")
+                if uncertainty_weights is not None:
+                    norm_w = uncertainty_weights.get_weights()
+                    sigma_parts = []
+                    for name, log_var in uncertainty_weights.log_vars.items():
+                        sigma = torch.exp(log_var / 2).item()
+                        w = norm_w[name].item()
+                        sigma_parts.append(f"{name}:σ={sigma:.3f}/w={w:.2f}")
+                    print(f"  {'Uncert':>{label_w}}   {' | '.join(sigma_parts)}")
+                # Log GENConv softmax temperature parameters
+                t_vals = []
+                for name, param in model.named_parameters():
+                    if 'aggr_module.t' in name and param.numel() == 1:
+                        # Extract layer identifier from name (e.g. backbone_layers.0.conv.aggr_module.t)
+                        parts = name.split('.')
+                        layer_name = '.'.join(parts[:2]) if len(parts) > 2 else name
+                        t_vals.append(f"{layer_name}={param.item():.3f}")
+                if t_vals:
+                    print(f"  {'GENConv t':>{label_w}}   {' '.join(t_vals)}")
 
             if epochs_without_improvement >= early_stopping_patience:
                 print(f"\nEarly stopping at epoch {epoch}")
@@ -1269,7 +1736,13 @@ def main():
         )
         stats = {
             'vdc': {'mean': vdc_mean, 'std': vdc_std},
-            'current': {'mean': current_mean, 'std': current_std}
+            'current': {'mean': current_mean, 'std': current_std},
+            'ss_gm': {'mean': ss_gm_mean, 'std': ss_gm_std} if has_ss else None,
+            'ss_gds': {'mean': ss_gds_mean, 'std': ss_gds_std} if has_ss else None,
+            'dc_gain': {'mean': dc_gain_mean, 'std': dc_gain_std} if dc_gain_loss_weight_target > 0 else None,
+            'ac': {'mean': ac_mean.tolist() if ac_mean is not None else None,
+                   'std': ac_std.tolist() if ac_std is not None else None,
+                   'components': ac_components} if ac_loss_weight_target > 0 else None,
         }
 
         # Add finetune provenance info
@@ -1335,6 +1808,28 @@ def main():
         print(f"gm  Acc @20%: {ss_m['gm_acc'][20]:5.1f}% | gds Acc @20%: {ss_m['gds_acc'][20]:5.1f}%")
         print(f"gm  Acc @50%: {ss_m['gm_acc'][50]:5.1f}% | gds Acc @50%: {ss_m['gds_acc'][50]:5.1f}%")
 
+    gm_id_m = rm.get('gm_id_metrics') if rm else None
+    if gm_id_m is not None:
+        print(f"\n--- gm/Id Evaluation ---")
+        print(f"gm/Id MAE: {gm_id_m['log_mae']:.3f} log10  (median {gm_id_m['log_median']:.3f}, median rel: {gm_id_m['median_rel']:.1f}%)")
+        print(f"gm/Id Acc @10%: {gm_id_m['acc'][10]:5.1f}%")
+        print(f"gm/Id Acc @20%: {gm_id_m['acc'][20]:5.1f}%")
+        print(f"gm/Id Acc @50%: {gm_id_m['acc'][50]:5.1f}%")
+
+    if ss_m is not None:
+        # MoE diagnostics
+        if 'moe_region_acc' in ss_m:
+            print(f"\n--- MoE Diagnostics ---")
+            print(f"Region head accuracy: {ss_m['moe_region_acc']:.1%}")
+            if ss_m.get('moe_avg_probs') is not None:
+                p = ss_m['moe_avg_probs']
+                print(f"Avg routing probs: cut={p[0]:.3f}  tri={p[1]:.3f}  sat={p[2]:.3f}")
+            for name in ['cutoff', 'triode', 'saturation']:
+                gm_k = f'moe_gm_mae_{name}'
+                gds_k = f'moe_gds_mae_{name}'
+                if gm_k in ss_m:
+                    print(f"  {name:12s}  gm MAE={ss_m[gm_k]:.4f}  gds MAE={ss_m[gds_k]:.4f}")
+
     # End-of-training AC and region evaluation on best model
     if best_model_state is not None and val_loader:
         model.load_state_dict(best_model_state)
@@ -1344,11 +1839,16 @@ def main():
         if ac_loss_weight_target > 0 and ac_mean is not None and ac_components:
             ac_errors = {comp: [] for comp in ac_components}
             ac_rel_errors = {comp: [] for comp in ac_components}
+            _use_iv = getattr(model, '_needs_autograd', False)
             with torch.no_grad():
                 for batch in val_loader:
                     if hasattr(batch, 'to'):
                         batch = batch.to(args.device)
-                    out_dict = model(batch)
+                    if _use_iv:
+                        with torch.enable_grad():
+                            out_dict = model(batch)
+                    else:
+                        out_dict = model(batch)
                     ac_pred = out_dict.get('ac_pred')
                     if ac_pred is None:
                         break
@@ -1379,28 +1879,89 @@ def main():
                     if comp == 'ugbw':
                         print(f"  UGBW  MAE: {errs.mean():.3f} log10(Hz)  (median {np.median(errs):.3f})")
                         ugbw_rel = np.array(ac_rel_errors[comp])
+                        print(f"  UGBW  within  5%:  {100*np.mean(ugbw_rel < 5):.1f}%")
                         print(f"  UGBW  within 10%:  {100*np.mean(ugbw_rel < 10):.1f}%")
                         print(f"  UGBW  within 20%:  {100*np.mean(ugbw_rel < 20):.1f}%")
-                        print(f"  UGBW  within 50%:  {100*np.mean(ugbw_rel < 50):.1f}%")
                     elif comp == 'pm':
                         print(f"  PM    MAE: {errs.mean():.1f} deg  (median {np.median(errs):.1f})")
-                        print(f"  PM    within 5d:   {100*np.mean(errs < 5):.1f}%")
+                        print(f"  PM    within  5d:  {100*np.mean(errs < 5):.1f}%")
                         print(f"  PM    within 10d:  {100*np.mean(errs < 10):.1f}%")
+                        print(f"  PM    within 20d:  {100*np.mean(errs < 20):.1f}%")
                     elif comp == 'am':
                         print(f"  AM    MAE: {errs.mean():.1f} dB  (median {np.median(errs):.1f})")
+                        print(f"  AM    within 1dB:  {100*np.mean(errs < 1):.1f}%")
                         print(f"  AM    within 3dB:  {100*np.mean(errs < 3):.1f}%")
-                        print(f"  AM    within 6dB:  {100*np.mean(errs < 6):.1f}%")
+                        print(f"  AM    within 5dB:  {100*np.mean(errs < 5):.1f}%")
+
+        # DC gain evaluation
+        if dc_gain_loss_weight_target > 0:
+            dc_gain_errors = []
+            _use_iv = getattr(model, '_needs_autograd', False)
+            with torch.no_grad():
+                for batch in val_loader:
+                    if hasattr(batch, 'to'):
+                        batch = batch.to(args.device)
+                    if _use_iv:
+                        with torch.enable_grad():
+                            out_dict = model(batch)
+                    else:
+                        out_dict = model(batch)
+                    dc_pred = out_dict.get('dc_gain_pred')
+                    if dc_pred is None:
+                        break
+                    dc_target = batch.ac_dc_gain.to(args.device)
+                    # Denormalize predictions
+                    pred_db = dc_pred * dc_gain_std + dc_gain_mean
+                    dc_gain_errors.extend((pred_db - dc_target).abs().cpu().tolist())
+
+            if dc_gain_errors:
+                errs = np.array(dc_gain_errors)
+                print(f"\n--- DC Gain Evaluation (best model, val set) ---")
+                print(f"  MAE: {errs.mean():.2f} dB  (median {np.median(errs):.2f})")
+                print(f"  within  3dB:  {100*np.mean(errs < 3):.1f}%")
+                print(f"  within  5dB:  {100*np.mean(errs < 5):.1f}%")
+                print(f"  within 10dB:  {100*np.mean(errs < 10):.1f}%")
+                # Validity classifier accuracy: predict dc_gain > 0 as "valid"
+                all_preds_db = []
+                all_targets_db = []
+                with torch.no_grad():
+                    for batch in val_loader:
+                        if hasattr(batch, 'to'):
+                            batch = batch.to(args.device)
+                        if _use_iv:
+                            with torch.enable_grad():
+                                out_dict = model(batch)
+                        else:
+                            out_dict = model(batch)
+                        dc_pred = out_dict.get('dc_gain_pred')
+                        if dc_pred is None:
+                            break
+                        pred_db = dc_pred * dc_gain_std + dc_gain_mean
+                        all_preds_db.extend(pred_db.cpu().tolist())
+                        all_targets_db.extend(batch.ac_dc_gain.cpu().tolist())
+                if all_preds_db:
+                    preds_arr = np.array(all_preds_db)
+                    targets_arr = np.array(all_targets_db)
+                    pred_valid = preds_arr > 0
+                    actual_valid = targets_arr > 0
+                    accuracy = np.mean(pred_valid == actual_valid) * 100
+                    print(f"  Validity classifier (dc_gain>0): {accuracy:.1f}% accuracy")
 
         # Region classification evaluation
         if region_loss_weight_target > 0:
             region_names = ['cutoff', 'triode', 'saturation']
             all_preds = []
             all_labels = []
+            _use_iv = getattr(model, '_needs_autograd', False)
             with torch.no_grad():
                 for batch in val_loader:
                     if hasattr(batch, 'to'):
                         batch = batch.to(args.device)
-                    out_dict = model(batch)
+                    if _use_iv:
+                        with torch.enable_grad():
+                            out_dict = model(batch)
+                    else:
+                        out_dict = model(batch)
                     rpred = out_dict.get('mosfet_region_pred')
                     if rpred is None:
                         break
@@ -1441,13 +2002,19 @@ def main():
         train_ss_gds_losses=train_ss_gds_losses, val_ss_gds_losses=val_ss_gds_losses,
         train_kcl_losses=train_kcl_losses, val_kcl_losses=val_kcl_losses,
         train_ac_losses=train_ac_losses, val_ac_losses=val_ac_losses,
+        train_ac_component_losses=train_ac_component_losses, val_ac_component_losses=val_ac_component_losses,
         train_region_losses=train_region_losses, val_region_losses=val_region_losses,
         train_gm_physics_losses=train_gm_physics_losses, val_gm_physics_losses=val_gm_physics_losses,
         train_triode_physics_losses=train_triode_physics_losses if triode_physics_loss_weight_target > 0 else None,
         val_triode_physics_losses=val_triode_physics_losses if triode_physics_loss_weight_target > 0 else None,
         train_cutoff_physics_losses=train_cutoff_physics_losses if cutoff_physics_loss_weight_target > 0 else None,
         val_cutoff_physics_losses=val_cutoff_physics_losses if cutoff_physics_loss_weight_target > 0 else None,
-        num_train_batches=len(train_loader), num_val_batches=len(val_loader) if val_loader else 0
+        train_dc_gain_losses=train_dc_gain_losses if dc_gain_loss_weight > 0 else None,
+        val_dc_gain_losses=val_dc_gain_losses if dc_gain_loss_weight > 0 else None,
+        max_grad_norms=max_grad_norms, avg_grad_norms=avg_grad_norms,
+        num_train_batches=len(train_loader), num_val_batches=len(val_loader) if val_loader else 0,
+        train_mirror_losses=train_hc_mirror_losses if constraint_weight_target > 0 else None,
+        val_mirror_losses=val_hc_mirror_losses if constraint_weight_target > 0 else None,
     )
 
 

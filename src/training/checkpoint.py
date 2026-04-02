@@ -22,6 +22,7 @@ def create_model(
     jk_attention=False,
     jk_learn_temperature=False,
     norm_type='layer',
+    act_type='relu',
     skip_connection=True,
     predict_currents=False,
     voltage_head_config=None,
@@ -65,6 +66,7 @@ def create_model(
     vth_head_config=None,
     loop_attention_config=None,
     dc_gain_config=None,
+    gm_id_head_config=None,
 ):
     """
     Create a GNN model with the specified configuration.
@@ -120,6 +122,7 @@ def create_model(
         jk_attention=jk_attention,
         jk_learn_temperature=jk_learn_temperature,
         norm_type=norm_type,
+        act_type=act_type,
         skip_connection=skip_connection,
         predict_currents=predict_currents,
         voltage_head_config=voltage_head_config or {},
@@ -178,6 +181,8 @@ def create_model(
         loop_attention_config=loop_attention_config or {},
         # DC gain prediction head
         dc_gain_config=dc_gain_config or {},
+        # gm/Id auxiliary head
+        gm_id_head_config=gm_id_head_config or {},
     )
 
     # Create model using registry
@@ -215,6 +220,7 @@ def create_model_from_args(args, input_dim, device='cuda'):
         jk_attention=args.jk_attention,
         jk_learn_temperature=getattr(args, 'jk_learn_temperature', False),
         norm_type=getattr(args, 'norm_type', 'layer'),
+        act_type=getattr(args, 'act_type', 'relu'),
         skip_connection=getattr(args, 'skip_connection', True),
         predict_currents=getattr(args, 'predict_currents', False),
         voltage_head_config=getattr(args, 'voltage_head_config', {}),
@@ -257,6 +263,7 @@ def create_model_from_args(args, input_dim, device='cuda'):
         vth_head_config=getattr(args, 'vth_head_config', {}),
         loop_attention_config=getattr(args, 'loop_attention_config', {}),
         dc_gain_config=getattr(args, 'dc_gain_config', {}),
+        gm_id_head_config=getattr(args, 'gm_id_head_config', {}),
     )
 
 
@@ -432,6 +439,9 @@ def load_checkpoint(checkpoint_path, device='cuda'):
         vov_head_config=config.get('vov_head_config', {}),
         vth_head_config=config.get('vth_head_config', {}),
         dc_gain_config=config.get('dc_gain_config', {}),
+        act_type=config.get('act_type', 'relu'),
+        loop_attention_config=config.get('loop_attention_config', {}),
+        gm_id_head_config=config.get('gm_id_head_config', {}),
     )
 
     # Load weights and move to device
@@ -535,6 +545,16 @@ def build_full_config(args, total_input_dim, predict_currents, voltage_head_conf
         'sensitivity_tower_jk_config': getattr(args, 'sensitivity_tower_jk_config', {}),
         # DC gain prediction head config
         'dc_gain_config': getattr(args, 'dc_gain_config', {}),
+        # Activation type
+        'act_type': getattr(args, 'act_type', 'relu'),
+        # Loop attention config
+        'loop_attention_config': getattr(args, 'loop_attention_config', {}),
+        # gm/Id auxiliary head config
+        'gm_id_head_config': getattr(args, 'gm_id_head_config', {}),
+        # Virtual node config
+        'vn_config': getattr(args, 'vn_config', {}),
+        # Device pooling current
+        'use_device_pooling_current': getattr(args, 'use_device_pooling_current', False),
         # Training params
         'learning_rate': args.lr,
         'weight_decay': getattr(args, 'weight_decay', 0.0),

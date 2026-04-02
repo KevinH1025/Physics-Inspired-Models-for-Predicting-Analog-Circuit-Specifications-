@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch_geometric.nn as PyGnn
 import torch_geometric.utils
 from torch_scatter import scatter
+from .layers import get_activation
 
 
 class VirtualNode(nn.Module):
@@ -42,6 +43,7 @@ class VirtualNode(nn.Module):
         num_heads: int = 4,
         head_dim: int = 32,
         num_layers: int = 1,
+        act_type: str = 'relu',
     ):
         super().__init__()
 
@@ -78,7 +80,7 @@ class VirtualNode(nn.Module):
             self.mlp = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                nn.ReLU(),
+                get_activation(act_type),
                 nn.Linear(hidden_dim, hidden_dim),
             )
 
@@ -86,7 +88,7 @@ class VirtualNode(nn.Module):
             if use_attention_pooling:
                 self.attention_mlp = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim // 2),
-                    nn.ReLU(),
+                    get_activation(act_type),
                     nn.Linear(hidden_dim // 2, 1),
                 )
                 if learn_temperature:

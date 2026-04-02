@@ -14,7 +14,7 @@ from torch.utils.checkpoint import checkpoint
 from typing import Dict, Optional
 
 from ..registry import register_model
-from ..components.layers import build_mlp, create_deepgcn_layer
+from ..components.layers import build_mlp, create_deepgcn_layer, get_activation
 from ..components.virtual_node import VirtualNode
 from .base import BaseGNN
 
@@ -30,6 +30,7 @@ class JKAggregation(nn.Module):
         attention: bool = False,
         learn_temperature: bool = False,
         gated_residual: bool = False,
+        act_type: str = 'relu',
     ):
         super().__init__()
         self.mode = mode
@@ -37,13 +38,14 @@ class JKAggregation(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_outputs = num_outputs
         self.gated_residual = gated_residual
+        self.act_type = act_type
 
         if gated_residual:
             # Attention over layers 0..N-2, gated addition to last layer
             n_early = max(num_outputs - 1, 1)
             self.attn = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
+                get_activation(self.act_type),
                 nn.Linear(hidden_dim // 2, 1),
             )
             self.register_buffer('temperature', torch.tensor(1.0))
@@ -54,7 +56,7 @@ class JKAggregation(nn.Module):
         elif attention:
             self.attn = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
+                get_activation(self.act_type),
                 nn.Linear(hidden_dim // 2, 1),
             )
             if learn_temperature:
@@ -123,8 +125,9 @@ class AttentionSSHead(nn.Module):
 
     def __init__(self, terminal_dim: int, ctx_dim: int = 0, hidden_dim: int = 512,
                  num_attn_layers: int = 1, num_heads: int = 4, mlp_layers: int = 2,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0, act_type: str = 'relu'):
         super().__init__()
+        self.act_type = act_type
         self.token_dim = terminal_dim + ctx_dim  # each terminal gets its context appended
         # Project all tokens to a common dim divisible by num_heads
         d_model = hidden_dim
@@ -152,7 +155,7 @@ class AttentionSSHead(nn.Module):
         for i in range(num_layers):
             out = hidden_dim // (2 ** i) if num_layers > 1 else hidden_dim
             out = max(out, 1)
-            layers.extend([nn.Linear(curr, out), nn.LayerNorm(out), nn.ReLU()])
+            layers.extend([nn.Linear(curr, out), nn.LayerNorm(out), get_activation(self.act_type)])
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             curr = out
@@ -198,8 +201,9 @@ class GatedSSHead(nn.Module):
     with learned gates selecting relevant interactions for gm vs gds."""
 
     def __init__(self, terminal_dim: int, ctx_dim: int = 0, hidden_dim: int = 512,
-                 mlp_layers: int = 2, dropout: float = 0.0):
+                 mlp_layers: int = 2, dropout: float = 0.0, act_type: str = 'relu'):
         super().__init__()
+        self.act_type = act_type
         self.terminal_dim = terminal_dim
 
         # Pairwise interaction projections
@@ -231,7 +235,7 @@ class GatedSSHead(nn.Module):
         for i in range(num_layers):
             out = hidden_dim // (2 ** i) if num_layers > 1 else hidden_dim
             out = max(out, 1)
-            layers.extend([nn.Linear(curr, out), nn.LayerNorm(out), nn.ReLU()])
+            layers.extend([nn.Linear(curr, out), nn.LayerNorm(out), get_activation(self.act_type)])
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             curr = out
@@ -340,6 +344,7 @@ class TowerGENConv(BaseGNN):
 
         self.hidden_dim = hidden_dim
         self.node_feature_dim = node_feature_dim
+        self.act_type = kwargs.get('act_type', 'relu')
         self.skip_connection = skip_connection
         self.predict_currents = predict_currents
         self.use_device_pooling_current = use_device_pooling_current
@@ -367,7 +372,7 @@ class TowerGENConv(BaseGNN):
 
         # --- Backbone layers ---
         self.backbone = nn.ModuleList([
-            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
+            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
             for _ in range(backbone_layers)
         ])
 
@@ -382,6 +387,7 @@ class TowerGENConv(BaseGNN):
                 num_heads=vn_num_heads,
                 head_dim=vn_head_dim,
                 num_layers=backbone_layers,
+                act_type=self.act_type,
             )
         else:
             self.virtual_node = None
@@ -390,6 +396,7 @@ class TowerGENConv(BaseGNN):
         loop_attn_cfg = loop_attention_config or {}
         self.use_loop_attention = loop_attn_cfg.get('enabled', False)
         self.loop_attn_warmup_epochs = loop_attn_cfg.get('warmup_epochs', 0)
+        self.loop_attn_warmup_duration = loop_attn_cfg.get('warmup_duration', 0)
         self.current_epoch = 0  # set by training loop
         if self.use_loop_attention:
             from src.gnn.components.loop_attention import LoopAttention
@@ -409,6 +416,7 @@ class TowerGENConv(BaseGNN):
                     fusion=loop_attn_cfg.get('fusion', 'add'),
                     dropout=dropout,
                     level=loop_attn_cfg.get('level', 'device'),
+                    pool_mode=loop_attn_cfg.get('pool_mode', 'mean'),
                 ) for _ in range(n_loop_layers)
             ])
 
@@ -420,11 +428,12 @@ class TowerGENConv(BaseGNN):
             attention=backbone_jk_config.get('attention', True),
             learn_temperature=backbone_jk_config.get('learn_temperature', False),
             gated_residual=backbone_jk_config.get('gated_residual', False),
+            act_type=self.act_type,
         )
 
         # --- State Tower (V/I) ---
         self.state_tower = nn.ModuleList([
-            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
+            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
             for _ in range(state_tower_layers)
         ])
 
@@ -435,6 +444,7 @@ class TowerGENConv(BaseGNN):
             attention=state_tower_jk_config.get('attention', False),
             learn_temperature=state_tower_jk_config.get('learn_temperature', False),
             gated_residual=state_tower_jk_config.get('gated_residual', False),
+            act_type=self.act_type,
         )
 
         # Prediction heads input dim
@@ -444,7 +454,7 @@ class TowerGENConv(BaseGNN):
         v_layers = voltage_head_config.get('num_layers', 1)
         v_hidden = voltage_head_config.get('hidden_dim', hidden_dim)
         v_dropout = voltage_head_config.get('dropout', 0.0)
-        self.voltage_head = build_mlp(v_layers, mlp_input_dim, v_hidden, 1, norm_type, v_dropout)
+        self.voltage_head = build_mlp(v_layers, mlp_input_dim, v_hidden, 1, norm_type, v_dropout, act_type=self.act_type)
 
         # Current head (optional)
         self.use_autograd_ss = current_head_config.get('autograd_ss', False) and use_device_pooling_current
@@ -469,10 +479,10 @@ class TowerGENConv(BaseGNN):
                 c_layers = current_head_config.get('num_layers', 2)
                 c_hidden = current_head_config.get('hidden_dim', hidden_dim)
                 c_dropout = current_head_config.get('dropout', 0.0)
-                self.current_head = build_mlp(c_layers, mlp_input_dim, c_hidden, 1, norm_type, c_dropout)
+                self.current_head = build_mlp(c_layers, mlp_input_dim, c_hidden, 1, norm_type, c_dropout, act_type=self.act_type)
                 # Auxiliary current head for intermediate KCL (after state tower layer 0)
                 if state_tower_layers >= 2:
-                    self.aux_current_head = build_mlp(1, hidden_dim, hidden_dim, 1, norm_type, 0.0)
+                    self.aux_current_head = build_mlp(1, hidden_dim, hidden_dim, 1, norm_type, 0.0, act_type=self.act_type)
                 else:
                     self.aux_current_head = None
         else:
@@ -489,7 +499,7 @@ class TowerGENConv(BaseGNN):
             self.vov_head = nn.Sequential(
                 nn.Linear(3 * mlp_input_dim, vov_hidden),
                 nn.LayerNorm(vov_hidden),
-                nn.ReLU(),
+                get_activation(self.act_type),
                 nn.Linear(vov_hidden, 1),
             )
         else:
@@ -504,7 +514,7 @@ class TowerGENConv(BaseGNN):
             self.vth_head = nn.Sequential(
                 nn.Linear(4 * mlp_input_dim, vth_hidden),
                 nn.LayerNorm(vth_hidden),
-                nn.ReLU(),
+                get_activation(self.act_type),
                 nn.Linear(vth_hidden, 1),
             )
         else:
@@ -586,13 +596,13 @@ class TowerGENConv(BaseGNN):
                     self.state_sens_proj = nn.Sequential(
                         nn.Linear(hidden_dim * 2, hidden_dim),
                         nn.LayerNorm(hidden_dim),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                     )
 
                 self.ss_branch_layers = ss_head_config.get('sensitivity_branch_layers', 0)
 
                 self.sensitivity_tower = nn.ModuleList([
-                    create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
+                    create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
                     for _ in range(sensitivity_tower_layers)
                 ])
 
@@ -603,16 +613,17 @@ class TowerGENConv(BaseGNN):
                     attention=sensitivity_tower_jk_config.get('attention', False),
                     learn_temperature=sensitivity_tower_jk_config.get('learn_temperature', False),
                     gated_residual=sensitivity_tower_jk_config.get('gated_residual', False),
+                    act_type=self.act_type,
                 )
 
                 # Y-shaped branches: separate gm/gds GNN layers after shared sensitivity tower
                 if self.ss_branch_layers > 0:
                     self.gm_branch = nn.ModuleList([
-                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
+                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
                         for _ in range(self.ss_branch_layers)
                     ])
                     self.gds_branch = nn.ModuleList([
-                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim)
+                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
                         for _ in range(self.ss_branch_layers)
                     ])
                     self.gm_branch_jk = JKAggregation(
@@ -621,6 +632,7 @@ class TowerGENConv(BaseGNN):
                         mode=sensitivity_tower_jk_config.get('mode', 'last'),
                         attention=sensitivity_tower_jk_config.get('attention', False),
                         learn_temperature=sensitivity_tower_jk_config.get('learn_temperature', False),
+                        act_type=self.act_type,
                     )
                     self.gds_branch_jk = JKAggregation(
                         hidden_dim=hidden_dim,
@@ -628,6 +640,7 @@ class TowerGENConv(BaseGNN):
                         mode=sensitivity_tower_jk_config.get('mode', 'last'),
                         attention=sensitivity_tower_jk_config.get('attention', False),
                         learn_temperature=sensitivity_tower_jk_config.get('learn_temperature', False),
+                        act_type=self.act_type,
                     )
                 else:
                     self.gm_branch = None
@@ -680,7 +693,7 @@ class TowerGENConv(BaseGNN):
                     layers.extend([
                         nn.Linear(curr_dim, out_dim),
                         nn.LayerNorm(out_dim),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                     ])
                     if dropout > 0:
                         layers.append(nn.Dropout(dropout))
@@ -738,13 +751,22 @@ class TowerGENConv(BaseGNN):
                     self.state_context_mlp = nn.Sequential(
                         nn.Linear(4 * mlp_input_dim, state_ctx_dim),  # gate+drain+source+bulk from state
                         nn.LayerNorm(state_ctx_dim),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                     )
                     ss_input_dim += state_ctx_dim  # append state summary to sensitivity concat
                 else:
                     self.state_context_mlp = None
 
-                # Mixture-of-Experts: 3 expert heads per quantity (cutoff/triode/saturation)
+                # gm/Id head from sensitivity tower (can be alongside gm/gds heads)
+                self.ss_predict_gm_id = ss_head_config.get('predict_gm_id', False)
+                if self.ss_predict_gm_id:
+                    self.gm_id_ss_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
+                    self.register_buffer('ss_gm_id_mean_buf', torch.tensor(0.0))
+                    self.register_buffer('ss_gm_id_std_buf', torch.tensor(1.0))
+                else:
+                    self.gm_id_ss_head = None
+
+                # gm/gds heads (always created unless MoE)
                 self.ss_moe = ss_head_config.get('mixture_of_experts', False)
                 if self.ss_moe:
                     expert_hidden = ss_head_config.get('expert_hidden_dim', 256)
@@ -781,7 +803,7 @@ class TowerGENConv(BaseGNN):
                 for i in range(region_layers):
                     out_dim = region_hidden // (2 ** i) if region_layers > 1 else region_hidden
                     out_dim = max(out_dim, 1)
-                    reg_layers.extend([nn.Linear(curr_dim, out_dim), nn.LayerNorm(out_dim), nn.ReLU()])
+                    reg_layers.extend([nn.Linear(curr_dim, out_dim), nn.LayerNorm(out_dim), get_activation(self.act_type)])
                     if region_dropout > 0:
                         reg_layers.append(nn.Dropout(region_dropout))
                     curr_dim = out_dim
@@ -801,6 +823,27 @@ class TowerGENConv(BaseGNN):
             self.ss_moe = False
             self.predict_region = False
             self.region_head = None
+
+        # gm/Id auxiliary head (backbone-level, per-MOSFET)
+        gm_id_head_config = kwargs.get('gm_id_head_config', {})
+        self.predict_gm_id = gm_id_head_config.get('enabled', False)
+        if self.predict_gm_id:
+            gm_id_hidden = gm_id_head_config.get('hidden_dim', 128)
+            gm_id_layers = gm_id_head_config.get('num_layers', 2)
+            gm_id_input_dim = 3 * mlp_input_dim  # gate+drain+source from backbone_repr
+            gm_id_mlp = []
+            curr_dim = gm_id_input_dim
+            for i in range(gm_id_layers):
+                out_dim = max(gm_id_hidden // (2 ** i), 1)
+                gm_id_mlp.extend([nn.Linear(curr_dim, out_dim), nn.LayerNorm(out_dim), get_activation(self.act_type)])
+                curr_dim = out_dim
+            gm_id_mlp.append(nn.Linear(curr_dim, 1))
+            self.gm_id_head = nn.Sequential(*gm_id_mlp)
+        else:
+            self.gm_id_head = None
+        self.gmid_as_feature = gm_id_head_config.get('as_feature', False) and self.predict_gm_id
+        if self.gmid_as_feature:
+            self.gmid_feature_proj = nn.Linear(hidden_dim + 1, hidden_dim)
 
         # AC head (graph-level: UGBW, PM, AM)
         ac_head_config = kwargs.get('ac_head_config', {})
@@ -823,7 +866,7 @@ class TowerGENConv(BaseGNN):
                     # Layer attention: score each backbone layer's pooled MHA output
                     self.ac_layer_attn = nn.Sequential(
                         nn.Linear(hidden_dim, 64),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                         nn.Linear(64, 1),
                     )
                     if self.ac_readout == 'cross_attn':
@@ -843,17 +886,17 @@ class TowerGENConv(BaseGNN):
                         self.ac_head = nn.Sequential(
                             nn.Linear(ac_mlp_input, 256),
                             nn.LayerNorm(256),
-                            nn.ReLU(),
+                            get_activation(self.act_type),
                             nn.Linear(256, 128),
                             nn.LayerNorm(128),
-                            nn.ReLU(),
+                            get_activation(self.act_type),
                             nn.Linear(128, ac_output_dim),
                         )
                     else:  # mha_pool: just layer-attended MHA pool → MLP
                         self.ac_head = nn.Sequential(
                             nn.Linear(hidden_dim, 128),
                             nn.LayerNorm(128),
-                            nn.ReLU(),
+                            get_activation(self.act_type),
                             nn.Linear(128, ac_output_dim),
                         )
                 elif self.ac_readout == 'vn':
@@ -861,13 +904,31 @@ class TowerGENConv(BaseGNN):
                     ac_hidden = ac_head_config.get('hidden_dim', 128)
                     ac_layers = ac_head_config.get('num_layers', 3)
                     ac_input_dim = hidden_dim  # vn_emb is [B, hidden_dim]
-                    self.ac_head = build_mlp(ac_layers, ac_input_dim, ac_hidden, ac_output_dim, norm_type, ac_dropout)
+                    self.ac_head = build_mlp(ac_layers, ac_input_dim, ac_hidden, ac_output_dim, norm_type, ac_dropout, act_type=self.act_type)
+                elif self.ac_readout == 'mosfet_concat':
+                    # Flatten 14 key MOSFET embeddings from sensitivity tower
+                    self.register_buffer('_ac_mosfet_indices', torch.tensor(
+                        [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                    self.ac_detach = ac_head_config.get('detach', True)
+                    concat_input_dim = 14 * mlp_input_dim  # 2086
+                    self.ac_head = nn.Sequential(
+                        nn.Linear(concat_input_dim, 512),
+                        nn.LayerNorm(512),
+                        get_activation(self.act_type),
+                        nn.Linear(512, 256),
+                        nn.LayerNorm(256),
+                        get_activation(self.act_type),
+                        nn.Linear(256, 128),
+                        nn.LayerNorm(128),
+                        get_activation(self.act_type),
+                        nn.Linear(128, ac_output_dim),
+                    )
                 else:
                     # 'pool' fallback: mean+max pool of state_repr
                     ac_hidden = ac_head_config.get('hidden_dim', 128)
                     ac_layers = ac_head_config.get('num_layers', 3)
                     ac_input_dim = mlp_input_dim * 2  # mean+max pool
-                    self.ac_head = build_mlp(ac_layers, ac_input_dim, ac_hidden, ac_output_dim, norm_type, ac_dropout)
+                    self.ac_head = build_mlp(ac_layers, ac_input_dim, ac_hidden, ac_output_dim, norm_type, ac_dropout, act_type=self.act_type)
 
         # Flag for capturing MHA outputs in _run_layers (updated after DC gain init)
         self._need_mha_capture = (self.predict_ac and getattr(self, 'ac_readout', '') in ('cross_attn', 'mha_pool'))
@@ -899,6 +960,7 @@ class TowerGENConv(BaseGNN):
                 r_f = float(dc_gain_config.get('r_f', 50000.0))
                 self.register_buffer('_dc_r_in', torch.tensor(r_in))
                 self.register_buffer('_dc_r_f', torch.tensor(r_f))
+                self._dc_rout1_formula = dc_gain_config.get('rout1_formula', 'cascode')
                 # Optional: augment with VN embedding for global circuit context
                 self.dc_gain_use_vn = dc_gain_config.get('use_vn_context', False)
                 dc_physics_dim = 35  # 14 gm + 14 gds + 7 formula intermediates
@@ -910,24 +972,185 @@ class TowerGENConv(BaseGNN):
                     else:
                         self.dc_gain_vn_proj = None
                         dc_physics_dim += hidden_dim
+                # Optional: augment with projected device embeddings from sensitivity tower
+                self.dc_gain_use_device_ctx = dc_gain_config.get('use_device_context', False)
+                if self.dc_gain_use_device_ctx:
+                    dc_dev_proj_dim = dc_gain_config.get('device_proj_dim', 32)
+                    self.dc_gain_dev_proj = nn.Sequential(
+                        nn.Linear(3 * mlp_input_dim, 128),
+                        nn.LayerNorm(128),
+                        get_activation(self.act_type),
+                        nn.Linear(128, dc_dev_proj_dim),
+                    )
+                    dc_physics_dim += 14 * dc_dev_proj_dim
                 dc_hidden = dc_gain_config.get('hidden_dim', 64)
                 dc_num_layers = dc_gain_config.get('num_layers', 2)
                 if dc_num_layers == 1:
                     self.dc_gain_head = nn.Sequential(
                         nn.Linear(dc_physics_dim, dc_hidden),
                         nn.LayerNorm(dc_hidden),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                         nn.Linear(dc_hidden, 1),
                     )
                 else:
                     self.dc_gain_head = nn.Sequential(
                         nn.Linear(dc_physics_dim, dc_hidden),
                         nn.LayerNorm(dc_hidden),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                         nn.Linear(dc_hidden, dc_hidden // 2),
                         nn.LayerNorm(dc_hidden // 2),
-                        nn.ReLU(),
+                        get_activation(self.act_type),
                         nn.Linear(dc_hidden // 2, 1),
+                    )
+            elif self.dc_gain_mode == 'vn_mlp':
+                # VN embedding → MLP (simplest learned DC gain)
+                dc_hidden = dc_gain_config.get('hidden_dim', 128)
+                self.dc_gain_head = nn.Sequential(
+                    nn.Linear(hidden_dim, dc_hidden),
+                    nn.LayerNorm(dc_hidden),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden, dc_hidden // 2),
+                    nn.LayerNorm(dc_hidden // 2),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden // 2, 1),
+                )
+            elif self.dc_gain_mode == 'concat_mlp':
+                # Flatten all 14 key MOSFET embeddings → MLP (no compression)
+                self.register_buffer('_dc_mosfet_indices', torch.tensor(
+                    [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                self.dc_gain_detach_ss = dc_gain_config.get('detach_ss', True)
+                concat_input_dim = 14 * mlp_input_dim  # 14 × 149 = 2086
+                self.dc_gain_head = nn.Sequential(
+                    nn.Linear(concat_input_dim, 512),
+                    nn.LayerNorm(512),
+                    get_activation(self.act_type),
+                    nn.Linear(512, 256),
+                    nn.LayerNorm(256),
+                    get_activation(self.act_type),
+                    nn.Linear(256, 128),
+                    nn.LayerNorm(128),
+                    get_activation(self.act_type),
+                    nn.Linear(128, 1),
+                )
+            elif self.dc_gain_mode == 'stage_pool':
+                # Per-stage mean pooling → concat → MLP
+                self.register_buffer('_dc_mosfet_indices', torch.tensor(
+                    [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                self.register_buffer('_dc_bias_indices', torch.tensor(
+                    [0, 1, 2, 3, 4], dtype=torch.long))
+                self.dc_gain_detach_ss = dc_gain_config.get('detach_ss', True)
+                stage_input_dim = 4 * mlp_input_dim  # 4 × 149 = 596
+                self.dc_gain_head = nn.Sequential(
+                    nn.Linear(stage_input_dim, 256),
+                    nn.LayerNorm(256),
+                    get_activation(self.act_type),
+                    nn.Linear(256, 128),
+                    nn.LayerNorm(128),
+                    get_activation(self.act_type),
+                    nn.Linear(128, 1),
+                )
+            elif self.dc_gain_mode == 'physics_cross_attn':
+                # Physics formula + cross-attention correction from device embeddings
+                # Same physics setup as 'physics' mode
+                self.register_buffer('_dc_mosfet_indices', torch.tensor(
+                    [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                self.dc_gain_detach_ss = dc_gain_config.get('detach_ss', False)
+                if not hasattr(self, 'ss_gm_mean_buf'):
+                    self.register_buffer('ss_gm_mean_buf', torch.tensor(0.0))
+                    self.register_buffer('ss_gm_std_buf', torch.tensor(1.0))
+                    self.register_buffer('ss_gds_mean_buf', torch.tensor(0.0))
+                    self.register_buffer('ss_gds_std_buf', torch.tensor(1.0))
+                r_in = float(dc_gain_config.get('r_in', 50000.0))
+                r_f = float(dc_gain_config.get('r_f', 50000.0))
+                self.register_buffer('_dc_r_in', torch.tensor(r_in))
+                self.register_buffer('_dc_r_f', torch.tensor(r_f))
+                self._dc_rout1_formula = dc_gain_config.get('rout1_formula', 'cascode')
+
+                # Physics correction MLP (same as physics mode)
+                dc_hidden = dc_gain_config.get('hidden_dim', 128)
+                self.dc_gain_head = nn.Sequential(
+                    nn.Linear(35, dc_hidden),
+                    nn.LayerNorm(dc_hidden),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden, dc_hidden // 2),
+                    nn.LayerNorm(dc_hidden // 2),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden // 2, 1),
+                )
+
+                # Cross-attention: physics features query device embeddings
+                dc_attn_dim = 128  # 4 heads × 32
+                n_physics_tokens = 35
+                self.dc_ca_physics_proj = nn.Sequential(
+                    nn.Linear(1, dc_attn_dim),
+                    get_activation(self.act_type),
+                )
+                self.dc_ca_physics_type_embed = nn.Embedding(n_physics_tokens, dc_attn_dim)
+                self.dc_ca_device_proj = nn.Linear(mlp_input_dim, dc_attn_dim)
+                self.dc_ca_device_type_embed = nn.Embedding(14, dc_attn_dim)
+                self.dc_ca_cross_attn = nn.MultiheadAttention(
+                    embed_dim=dc_attn_dim, num_heads=4,
+                    batch_first=True, dropout=0.0,
+                )
+                self.dc_ca_norm = nn.LayerNorm(dc_attn_dim)
+                self.dc_ca_pool = nn.Sequential(
+                    nn.Linear(n_physics_tokens * dc_attn_dim, 256),
+                    nn.LayerNorm(256),
+                    get_activation(self.act_type),
+                    nn.Linear(256, 128),
+                    nn.LayerNorm(128),
+                    get_activation(self.act_type),
+                    nn.Linear(128, 1),
+                )
+                # Learnable gate for correction strength
+                self.dc_ca_gate = nn.Sequential(
+                    nn.Linear(2, 1),
+                    nn.Sigmoid(),
+                )
+            elif self.dc_gain_mode in ('physics_residual', 'physics_gated'):
+                # Physics formula + learned correction (residual or gated)
+                self.register_buffer('_dc_mosfet_indices', torch.tensor(
+                    [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                self.dc_gain_detach_ss = dc_gain_config.get('detach_ss', False)
+                if not hasattr(self, 'ss_gm_mean_buf'):
+                    self.register_buffer('ss_gm_mean_buf', torch.tensor(0.0))
+                    self.register_buffer('ss_gm_std_buf', torch.tensor(1.0))
+                    self.register_buffer('ss_gds_mean_buf', torch.tensor(0.0))
+                    self.register_buffer('ss_gds_std_buf', torch.tensor(1.0))
+                r_in = float(dc_gain_config.get('r_in', 50000.0))
+                r_f = float(dc_gain_config.get('r_f', 50000.0))
+                self.register_buffer('_dc_r_in', torch.tensor(r_in))
+                self.register_buffer('_dc_r_f', torch.tensor(r_f))
+                self._dc_rout1_formula = dc_gain_config.get('rout1_formula', 'cascode')
+                # Physics correction MLP
+                dc_hidden = dc_gain_config.get('hidden_dim', 128)
+                self.dc_gain_head = nn.Sequential(
+                    nn.Linear(35, dc_hidden),
+                    nn.LayerNorm(dc_hidden),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden, dc_hidden // 2),
+                    nn.LayerNorm(dc_hidden // 2),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden // 2, 1),
+                )
+                # Learned MLP from 14 MOSFET embeddings
+                concat_input_dim = 14 * mlp_input_dim  # 2086
+                self.dc_gain_learned_head = nn.Sequential(
+                    nn.Linear(concat_input_dim, 512),
+                    nn.LayerNorm(512),
+                    get_activation(self.act_type),
+                    nn.Linear(512, 256),
+                    nn.LayerNorm(256),
+                    get_activation(self.act_type),
+                    nn.Linear(256, 128),
+                    nn.LayerNorm(128),
+                    get_activation(self.act_type),
+                    nn.Linear(128, 1),
+                )
+                if self.dc_gain_mode == 'physics_gated':
+                    self.dc_gain_gate = nn.Sequential(
+                        nn.Linear(2, 1),
+                        nn.Sigmoid(),
                     )
             else:
                 # Cross-attention mode (original)
@@ -943,12 +1166,12 @@ class TowerGENConv(BaseGNN):
                 )
                 self.dc_gain_attn_norm = nn.LayerNorm(dc_attn_dim)
                 self.dc_gain_head = nn.Sequential(
-                    nn.Linear(dc_attn_dim, 128), nn.LayerNorm(128), nn.ReLU(),
+                    nn.Linear(dc_attn_dim, 128), nn.LayerNorm(128), get_activation(self.act_type),
                     nn.Linear(128, 1),
                 )
 
         # Update MHA capture flag now that dc_gain_use_vn is known
-        if getattr(self, 'dc_gain_use_vn', False):
+        if getattr(self, 'dc_gain_use_vn', False) or self.dc_gain_mode == 'vn_mlp':
             self._need_mha_capture = True
 
         # Store config for checkpoint save/load
@@ -1070,7 +1293,13 @@ class TowerGENConv(BaseGNN):
                 else:
                     x_loop = None
                 if x_loop is not None:
-                    x = x + x_loop
+                    # Gradual warmup: ramp alpha from 0→1 over warmup_duration
+                    if self.loop_attn_warmup_duration > 0:
+                        warmup_progress = self.current_epoch - self.loop_attn_warmup_epochs
+                        alpha = min(1.0, warmup_progress / self.loop_attn_warmup_duration)
+                        x = x + alpha * x_loop
+                    else:
+                        x = x + x_loop
 
             # Update VN from nodes (default mode only — MHA is stateless)
             if vn_is_default:
@@ -1235,23 +1464,28 @@ class TowerGENConv(BaseGNN):
             for t, idx in enumerate(terms[:max_terms]):
                 dtm[d, t] = idx
 
-        # --- Node-level loop detection (terminal ↔ net bipartite graph) ---
-        # Build bipartite graph: terminal nodes ↔ net nodes (negative IDs for nets)
-        G_node = nx.Graph()
-        for term_idx, net_id in term_to_net.items():
-            G_node.add_edge(term_idx, -(net_id + 1))
-
-        node_cycles = nx.cycle_basis(G_node)
-        # Strip net nodes (negative IDs) → only terminal indices
-        terminal_cycles = [[n for n in cycle if n >= 0] for cycle in node_cycles]
-
-        # Build within-cycle full attention edges (bidirectional)
+        # --- Node-level loop edges: expand device cycles to terminal pairs ---
+        # Collect all loop-participating terminals per cycle, then full attention
         node_loop_edges = set()
-        for cycle in terminal_cycles:
-            for i in range(len(cycle)):
-                for j in range(i + 1, len(cycle)):
-                    node_loop_edges.add((cycle[i], cycle[j]))
-                    node_loop_edges.add((cycle[j], cycle[i]))
+        for cycle in cycles:  # reuse device-level cycles
+            # Find terminals on shared nets for each adjacent device pair
+            loop_terminals = set()
+            for idx in range(len(cycle)):
+                dev_a = cycle[idx]
+                dev_b = cycle[(idx + 1) % len(cycle)]
+                shared_nets = device_nets[dev_a] & device_nets[dev_b]
+                for ta in device_terms[dev_a]:
+                    if term_to_net.get(ta) in shared_nets:
+                        loop_terminals.add(ta)
+                for tb in device_terms[dev_b]:
+                    if term_to_net.get(tb) in shared_nets:
+                        loop_terminals.add(tb)
+            # Full attention between all loop-participating terminals
+            loop_terminals = list(loop_terminals)
+            for i in range(len(loop_terminals)):
+                for j in range(i + 1, len(loop_terminals)):
+                    node_loop_edges.add((loop_terminals[i], loop_terminals[j]))
+                    node_loop_edges.add((loop_terminals[j], loop_terminals[i]))
 
         if node_loop_edges:
             ns, nd = zip(*node_loop_edges)
@@ -1266,7 +1500,7 @@ class TowerGENConv(BaseGNN):
 
         if not getattr(self, '_loop_edges_printed', False):
             print(f"[LoopAttention] Computed: {num_devices} devices, {len(cycles)} device cycles, {loop_ei.shape[1]} device loop edges")
-            print(f"[LoopAttention] Node-level: {len(node_cycles)} terminal cycles, {node_loop_ei.shape[1]} terminal loop edges")
+            print(f"[LoopAttention] Node-level: {len(cycles)} device cycles expanded to {node_loop_ei.shape[1]} terminal loop edges")
             self._loop_edges_printed = True
 
         # Now replicate for this batch
@@ -1330,11 +1564,45 @@ class TowerGENConv(BaseGNN):
         backbone_hidden = self.backbone_jk(backbone_outputs)
         backbone_hidden = self.backbone[0].act(self.backbone[0].norm(backbone_hidden))
 
+        # --- gm/Id auxiliary prediction (backbone-level) ---
+        _gm_id_pred = None
+        if self.predict_gm_id and self.gm_id_head is not None:
+            mosfet_info_l = data.mosfet_info.long()
+            num_mosfets = mosfet_info_l.shape[0]
+            num_graphs = data.ptr.shape[0] - 1
+            mosfet_ptr = getattr(data, 'mosfet_ptr', None)
+            if mosfet_ptr is not None:
+                mg_idx = torch.bucketize(
+                    torch.arange(num_mosfets, device=data.ptr.device),
+                    mosfet_ptr[1:].to(data.ptr.device), right=True)
+            else:
+                mg_idx = torch.arange(num_mosfets, device=data.ptr.device) // (num_mosfets // num_graphs)
+            bb_offsets = data.ptr[mg_idx]
+            gate_bb = backbone_repr[mosfet_info_l[:, 0] + bb_offsets]
+            drain_bb = backbone_repr[mosfet_info_l[:, 1] + bb_offsets]
+            source_bb = backbone_repr[mosfet_info_l[:, 2] + bb_offsets]
+            gm_id_input = torch.cat([gate_bb, drain_bb, source_bb], dim=-1)
+            _gm_id_pred = self.gm_id_head(gm_id_input).squeeze(-1)
+
+        # --- Scatter detached gm/Id as feature for towers ---
+        tower_input = backbone_hidden
+        if self.gmid_as_feature and _gm_id_pred is not None:
+            gmid_detached = _gm_id_pred.detach()
+            gmid_node_feat = torch.zeros(backbone_hidden.shape[0], 1, device=backbone_hidden.device)
+            for term_col in [0, 1, 2]:  # G, D, S
+                term_idx = mosfet_info_l[:, term_col] + bb_offsets
+                gmid_node_feat[term_idx, 0] = gmid_detached
+            bulk_idx = mosfet_info_l[:, 2] + 1 + bb_offsets  # B = S + 1
+            gmid_node_feat[bulk_idx, 0] = gmid_detached
+            tower_input = self.gmid_feature_proj(
+                torch.cat([backbone_hidden, gmid_node_feat], dim=-1)
+            )
+
         # --- State Tower ---
         _state_loop = _loop_attn if (self.use_loop_attention and getattr(self, 'loop_attn_apply_to', 'backbone') == 'all') else None
         _state_offset = getattr(self, '_loop_attn_backbone_count', 0)
         state_outputs, _, _ = self._run_layers(
-            self.state_tower, backbone_hidden, data.edge_index, edge_attr,
+            self.state_tower, tower_input, data.edge_index, edge_attr,
             loop_attn_layers=_state_loop,
             loop_attn_offset=_state_offset,
             device_terminal_map=_loop_dtm,
@@ -1351,6 +1619,8 @@ class TowerGENConv(BaseGNN):
 
         # State predictions
         result = {}
+        if _gm_id_pred is not None:
+            result['mosfet_gm_id_pred'] = _gm_id_pred
         result['node_voltages'] = self.voltage_head(state_repr).squeeze(-1)
         result['node_embeddings'] = state_repr
 
@@ -1482,9 +1752,9 @@ class TowerGENConv(BaseGNN):
                 # Optionally condition on state tower embeddings
                 if self.state_conditioned_sens:
                     state_for_sens = state_hidden.detach() if self.detach_state_for_sens else state_hidden
-                    sens_input = self.state_sens_proj(torch.cat([backbone_hidden, state_for_sens], dim=-1))
+                    sens_input = self.state_sens_proj(torch.cat([tower_input, state_for_sens], dim=-1))
                 else:
-                    sens_input = backbone_hidden
+                    sens_input = tower_input
 
                 _sens_loop = _loop_attn if (self.use_loop_attention and self.loop_attn_apply_to in ('all', 'sensitivity')) else None
                 _sens_offset = 0 if (self.use_loop_attention and self.loop_attn_apply_to == 'sensitivity') else getattr(self, '_loop_attn_backbone_count', 0) + getattr(self, '_loop_attn_state_count', 0)
@@ -1709,6 +1979,8 @@ class TowerGENConv(BaseGNN):
                     else:
                         ss_input = sens_concat
 
+                    if getattr(self, 'ss_predict_gm_id', False) and self.gm_id_ss_head is not None:
+                        result['mosfet_gm_id_pred'] = self.gm_id_ss_head(ss_input).squeeze(-1)
                     if self.ss_moe and region_probs is not None:
                         # MoE: 3 expert heads per quantity, soft-routed by region probs
                         gm_expert_out = torch.stack(
@@ -1806,8 +2078,11 @@ class TowerGENConv(BaseGNN):
                 # 0=M8, 1=M9, 2=M5, 3=M6, 4=M15, 5=M16, 6=M19, 7=M20
                 # 8=M7, 9=M10, 10=M21, 11=M22, 12=M11, 13=M23
 
-                # Stage 1: A1 = gm8 * Rout1, Rout1 = 1/(gds6 + gds16)
-                Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)  # gds_M6 + gds_M16
+                # Stage 1: A1 = gm8 * Rout1
+                if self._dc_rout1_formula == 'simple':
+                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)  # 1/(gds6 + gds16)
+                else:  # cascode
+                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] * gds_lin[:, 7] / (gm_lin[:, 5] + 1e-15) + 1e-15)
                 A1 = gm_lin[:, 0] * Rout1  # gm_M8 * Rout1
 
                 # Stage 2: A2 = [gm10/(gm21+gds21+gds10)] * [gm22/(gds7+gds22)]
@@ -1842,22 +2117,182 @@ class TowerGENConv(BaseGNN):
                 parts = [gm_key, gds_key, formula_feats]
                 # Optionally augment with VN context for global circuit info
                 if self.dc_gain_use_vn:
-                    if vn_emb is not None:
-                        # Default VN mode: use graph-level VN embedding directly
-                        vn_graph = vn_emb.detach()
-                    elif len(backbone_mha_outputs) > 0:
+                    if len(backbone_mha_outputs) > 0:
                         # MHA mode: pool last MHA layer output to graph-level
                         from torch_geometric.nn import global_mean_pool
                         vn_graph = global_mean_pool(backbone_mha_outputs[-1].detach(), batch_vec)
+                    elif vn_emb is not None:
+                        # Default VN mode: use graph-level VN embedding directly
+                        vn_graph = vn_emb.detach()
                     else:
                         vn_graph = None
                     if vn_graph is not None:
                         vn_feat = self.dc_gain_vn_proj(vn_graph) if self.dc_gain_vn_proj is not None else vn_graph
                         parts.append(vn_feat)
-                physics_input = torch.cat(parts, dim=-1)  # [B, 35+vn_dim]
+                # Optionally augment with projected device embeddings from sensitivity tower
+                if getattr(self, 'dc_gain_use_device_ctx', False):
+                    idx = self._dc_mosfet_indices
+                    gate_sens = sens_repr[mosfet_info[:, 0] + offsets].view(B, M, -1)[:, idx]
+                    drain_sens = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)[:, idx]
+                    source_sens = sens_repr[mosfet_info[:, 2] + offsets].view(B, M, -1)[:, idx]
+                    dev_concat = torch.cat([gate_sens, drain_sens, source_sens], dim=-1)  # [B, 14, 447]
+                    if self.dc_gain_detach_ss:
+                        dev_concat = dev_concat.detach()
+                    dev_proj = self.dc_gain_dev_proj(dev_concat)  # [B, 14, 32]
+                    parts.append(dev_proj.reshape(B, -1))  # [B, 448]
+
+                physics_input = torch.cat(parts, dim=-1)  # [B, 35+448]
 
                 result['dc_gain_pred'] = self.dc_gain_head(physics_input).squeeze(-1)  # [B]
                 result['dc_gain_physics_est_dB'] = dc_gain_est_dB.detach()  # for diagnostics
+            elif self.dc_gain_mode == 'vn_mlp':
+                # VN embedding → MLP (simplest learned DC gain)
+                from torch_geometric.nn import global_mean_pool
+                if len(backbone_mha_outputs) > 0:
+                    vn_input = global_mean_pool(backbone_mha_outputs[-1].detach(), batch_vec)
+                elif vn_emb is not None:
+                    vn_input = vn_emb.detach()
+                else:
+                    vn_input = global_mean_pool(backbone_repr.detach(), batch_vec)
+                result['dc_gain_pred'] = self.dc_gain_head(vn_input).squeeze(-1)
+            elif self.dc_gain_mode == 'concat_mlp':
+                # Flatten 14 key MOSFET embeddings → MLP
+                B, M = num_graphs, 24
+                idx = self._dc_mosfet_indices
+                key_emb = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)[:, idx]  # [B, 14, 149]
+                if self.dc_gain_detach_ss:
+                    key_emb = key_emb.detach()
+                result['dc_gain_pred'] = self.dc_gain_head(key_emb.reshape(B, -1)).squeeze(-1)
+            elif self.dc_gain_mode == 'stage_pool':
+                # Per-stage mean pool → concat → MLP
+                B, M = num_graphs, 24
+                idx = self._dc_mosfet_indices
+                bias_idx = self._dc_bias_indices
+                all_emb = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)
+                if self.dc_gain_detach_ss:
+                    all_emb = all_emb.detach()
+                key_emb = all_emb[:, idx]
+                stage1 = key_emb[:, 0:8].mean(dim=1)
+                stage2 = key_emb[:, 8:12].mean(dim=1)
+                stage3 = key_emb[:, 12:14].mean(dim=1)
+                bias = all_emb[:, bias_idx].mean(dim=1)
+                result['dc_gain_pred'] = self.dc_gain_head(
+                    torch.cat([stage1, stage2, stage3, bias], dim=-1)
+                ).squeeze(-1)
+            elif self.dc_gain_mode == 'physics_cross_attn':
+                # Physics formula + cross-attention correction
+                # Step 1: Same physics formula as 'physics' mode
+                gm_pred = result['mosfet_gm_pred']
+                gds_pred = result['mosfet_gds_pred']
+                if self.dc_gain_detach_ss:
+                    gm_pred = gm_pred.detach()
+                    gds_pred = gds_pred.detach()
+                log10_gm = gm_pred * self.ss_gm_std_buf + self.ss_gm_mean_buf
+                log10_gds = gds_pred * self.ss_gds_std_buf + self.ss_gds_mean_buf
+                B, M = num_graphs, 24
+                idx = self._dc_mosfet_indices
+                gm_key = log10_gm.view(B, M)[:, idx]
+                gds_key = log10_gds.view(B, M)[:, idx]
+                gm_lin = torch.pow(10.0, gm_key.clamp(-12, 0))
+                gds_lin = torch.pow(10.0, gds_key.clamp(-12, 0))
+                # Stage gains (same formula as physics mode)
+                if self._dc_rout1_formula == 'simple':
+                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)
+                else:
+                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] * gds_lin[:, 7] / (gm_lin[:, 5] + 1e-15) + 1e-15)
+                A1 = gm_lin[:, 0] * Rout1
+                A2_part1 = gm_lin[:, 9] / (gm_lin[:, 10] + gds_lin[:, 10] + gds_lin[:, 9] + 1e-15)
+                A2 = A2_part1 * gm_lin[:, 11] / (gds_lin[:, 8] + gds_lin[:, 11] + 1e-15)
+                Rout3 = 1.0 / (gds_lin[:, 12] + gds_lin[:, 13] + 1e-15)
+                R_load = self._dc_r_in + self._dc_r_f
+                Rout3_loaded = 1.0 / (1.0 / (Rout3 + 1e-15) + 1.0 / R_load)
+                beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
+                T = A1 * Rout3_loaded * (gm_lin[:, 12] + A2 * gm_lin[:, 13]) * beta
+                dc_gain_est_dB = 20.0 * torch.log10(T.abs() + 1e-15)
+                formula_feats = torch.stack([
+                    torch.log10(Rout1.clamp(min=1e-15)), torch.log10(A1.clamp(min=1e-15)),
+                    torch.log10(A2_part1.clamp(min=1e-15)), torch.log10(A2.clamp(min=1e-15)),
+                    torch.log10(Rout3.clamp(min=1e-15)), torch.log10(Rout3_loaded.clamp(min=1e-15)),
+                    dc_gain_est_dB,
+                ], dim=-1)
+                physics_input = torch.cat([gm_key, gds_key, formula_feats], dim=-1)  # [B, 35]
+                physics_pred = self.dc_gain_head(physics_input).squeeze(-1)  # [B]
+
+                # Step 2: Cross-attention correction
+                # Physics query tokens: [B, 35, 1] → [B, 35, 128]
+                Q = self.dc_ca_physics_proj(physics_input.unsqueeze(-1))
+                type_ids = torch.arange(35, device=Q.device)
+                Q = Q + self.dc_ca_physics_type_embed(type_ids)
+
+                # Device key/value tokens: [B, 14, 149] → [B, 14, 128]
+                key_emb = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)[:, idx]
+                if self.dc_gain_detach_ss:
+                    key_emb = key_emb.detach()
+                KV = self.dc_ca_device_proj(key_emb)
+                dev_ids = torch.arange(14, device=KV.device)
+                KV = KV + self.dc_ca_device_type_embed(dev_ids)
+
+                # Cross-attention + residual + norm
+                attended, _ = self.dc_ca_cross_attn(Q, KV, KV)
+                attended = self.dc_ca_norm(Q + attended)
+
+                # Pool → correction scalar
+                correction = self.dc_ca_pool(attended.reshape(B, -1)).squeeze(-1)
+
+                # Gated residual: physics + gate * correction
+                gate = self.dc_ca_gate(torch.stack([physics_pred.detach(), correction], dim=-1))
+                result['dc_gain_pred'] = physics_pred + gate.squeeze(-1) * correction
+                result['dc_gain_physics_est_dB'] = dc_gain_est_dB.detach()
+            elif self.dc_gain_mode in ('physics_residual', 'physics_gated'):
+                # Physics formula + learned correction (residual or gated)
+                # Step 1: Same physics formula
+                gm_pred = result['mosfet_gm_pred']
+                gds_pred = result['mosfet_gds_pred']
+                if self.dc_gain_detach_ss:
+                    gm_pred = gm_pred.detach()
+                    gds_pred = gds_pred.detach()
+                log10_gm = gm_pred * self.ss_gm_std_buf + self.ss_gm_mean_buf
+                log10_gds = gds_pred * self.ss_gds_std_buf + self.ss_gds_mean_buf
+                B, M = num_graphs, 24
+                idx = self._dc_mosfet_indices
+                gm_key = log10_gm.view(B, M)[:, idx]
+                gds_key = log10_gds.view(B, M)[:, idx]
+                gm_lin = torch.pow(10.0, gm_key.clamp(-12, 0))
+                gds_lin = torch.pow(10.0, gds_key.clamp(-12, 0))
+                if self._dc_rout1_formula == 'simple':
+                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)
+                else:
+                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] * gds_lin[:, 7] / (gm_lin[:, 5] + 1e-15) + 1e-15)
+                A1 = gm_lin[:, 0] * Rout1
+                A2_part1 = gm_lin[:, 9] / (gm_lin[:, 10] + gds_lin[:, 10] + gds_lin[:, 9] + 1e-15)
+                A2 = A2_part1 * gm_lin[:, 11] / (gds_lin[:, 8] + gds_lin[:, 11] + 1e-15)
+                Rout3 = 1.0 / (gds_lin[:, 12] + gds_lin[:, 13] + 1e-15)
+                R_load = self._dc_r_in + self._dc_r_f
+                Rout3_loaded = 1.0 / (1.0 / (Rout3 + 1e-15) + 1.0 / R_load)
+                beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
+                T = A1 * Rout3_loaded * (gm_lin[:, 12] + A2 * gm_lin[:, 13]) * beta
+                dc_gain_est_dB = 20.0 * torch.log10(T.abs() + 1e-15)
+                formula_feats = torch.stack([
+                    torch.log10(Rout1.clamp(min=1e-15)), torch.log10(A1.clamp(min=1e-15)),
+                    torch.log10(A2_part1.clamp(min=1e-15)), torch.log10(A2.clamp(min=1e-15)),
+                    torch.log10(Rout3.clamp(min=1e-15)), torch.log10(Rout3_loaded.clamp(min=1e-15)),
+                    dc_gain_est_dB,
+                ], dim=-1)
+                physics_input = torch.cat([gm_key, gds_key, formula_feats], dim=-1)  # [B, 35]
+                physics_pred = self.dc_gain_head(physics_input).squeeze(-1)  # [B]
+
+                # Step 2: Learned path from 14 MOSFET embeddings
+                key_emb = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)[:, idx]  # [B, 14, 149]
+                if self.dc_gain_detach_ss:
+                    key_emb = key_emb.detach()
+                learned_pred = self.dc_gain_learned_head(key_emb.reshape(B, -1)).squeeze(-1)  # [B]
+
+                if self.dc_gain_mode == 'physics_residual':
+                    result['dc_gain_pred'] = physics_pred + learned_pred
+                else:  # physics_gated
+                    gate = self.dc_gain_gate(torch.stack([physics_pred.detach(), learned_pred], dim=-1)).squeeze(-1)
+                    result['dc_gain_pred'] = gate * physics_pred + (1 - gate) * learned_pred
+                result['dc_gain_physics_est_dB'] = dc_gain_est_dB.detach()
             else:
                 # Cross-attention mode (original)
                 B = num_graphs
@@ -1898,6 +2333,14 @@ class TowerGENConv(BaseGNN):
             elif self.ac_readout == 'vn' and vn_emb is not None:
                 # Use actual VN embedding (accumulated across all backbone layers)
                 result['ac_pred'] = self.ac_head(vn_emb.detach())
+            elif self.ac_readout == 'mosfet_concat':
+                # Flatten 14 key MOSFET embeddings from sensitivity tower
+                B, M = num_graphs, 24
+                idx = self._ac_mosfet_indices
+                key_emb = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)[:, idx]  # [B, 14, 149]
+                if self.ac_detach:
+                    key_emb = key_emb.detach()
+                result['ac_pred'] = self.ac_head(key_emb.reshape(B, -1))  # [B, ac_output_dim]
             else:
                 # Fallback: mean+max pool (for 'pool' mode or MHA mode where vn_emb is None)
                 from torch_geometric.nn import global_mean_pool, global_max_pool

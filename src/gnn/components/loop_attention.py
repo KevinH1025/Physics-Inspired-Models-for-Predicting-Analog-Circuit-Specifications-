@@ -34,6 +34,7 @@ class LoopAttention(nn.Module):
         fusion: str = 'add',
         dropout: float = 0.0,
         level: str = 'node',
+        pool_mode: str = 'mean',
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -41,11 +42,14 @@ class LoopAttention(nn.Module):
         self.head_dim = head_dim
         self.total_dim = num_heads * head_dim
         self.level = level
+        self.pool_mode = pool_mode
 
         self.W_q = nn.Linear(hidden_dim, self.total_dim, bias=False)
         self.W_k = nn.Linear(hidden_dim, self.total_dim, bias=False)
         self.W_v = nn.Linear(hidden_dim, self.total_dim, bias=False)
         self.W_out = nn.Linear(self.total_dim, hidden_dim, bias=False)
+        if pool_mode == 'attention':
+            self.pool_score = nn.Linear(hidden_dim, 1)
 
         self.norm = nn.LayerNorm(hidden_dim)
         self.attn_drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -120,8 +124,14 @@ class LoopAttention(nn.Module):
         safe_idx = device_terminal_map.clamp(min=0)
         term_emb = x[safe_idx]  # [D, max_terms, hidden_dim]
         term_emb = term_emb * mask.unsqueeze(-1).float()
-        counts = mask.sum(dim=1, keepdim=True).clamp(min=1).float()
-        device_emb = term_emb.sum(dim=1) / counts  # [D, hidden_dim]
+        if self.pool_mode == 'attention':
+            pool_scores = self.pool_score(term_emb).squeeze(-1)  # [D, max_terms]
+            pool_scores = pool_scores.masked_fill(~mask, float('-inf'))
+            pool_weights = torch.softmax(pool_scores, dim=1)  # [D, max_terms]
+            device_emb = (term_emb * pool_weights.unsqueeze(-1)).sum(dim=1)  # [D, hidden_dim]
+        else:
+            counts = mask.sum(dim=1, keepdim=True).clamp(min=1).float()
+            device_emb = term_emb.sum(dim=1) / counts  # [D, hidden_dim]
 
         # Sparse multi-head attention over loop edges
         src, dst = loop_edge_index

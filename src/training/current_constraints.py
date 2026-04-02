@@ -6,12 +6,148 @@ Provides loss functions that enforce circuit relationships:
 - Current mirror ratios: I_mirror/I_ref = WL_mirror/WL_ref
 """
 
+import math
+
 import torch
 from typing import Dict, List, Optional, Tuple
 
 # Default 2-stage opamp constraints (empty — individual constraints proved
 # redundant with KCL loss or too noisy for reliable training).
 OPAMP_2STAGE_CONSTRAINTS = {}
+
+# Hardcoded 3-stage opamp mirror pairs.
+# Each entry: (device_a, device_b, ratio) where |Id(A)| = ratio * |Id(B)|.
+# Default 3-stage opamp MOSFET device names (Xm prefix, netlist order).
+# Used as fallback when mosfet_device_names is not stored on graph Data.
+OPAMP_3STAGE_DEVICE_NAMES = [
+    'Xm0', 'Xm1', 'Xm2', 'Xm3', 'Xm4', 'Xm5', 'Xm6', 'Xm7',
+    'Xm8', 'Xm9', 'Xm19', 'Xm20', 'Xm15', 'Xm16', 'Xm14',
+    'Xm17', 'Xm12', 'Xm18', 'Xm13', 'Xm10', 'Xm21', 'Xm22',
+    'Xm11', 'Xm23',
+]
+
+OPAMP_3STAGE_MIRROR_PAIRS = [
+    ('M0', 'M1', 1.0),    # PMOS bias 1:1
+    ('M0', 'M2', 1.0),    # PMOS bias 1:1
+    ('M0', 'M3', 1.0),    # PMOS bias 1:1
+    ('M0', 'M7', 1.0),    # PMOS bias 1:1
+    ('M4', 'M0', 4.0),    # PMOS tail = 4x bias
+    ('M5', 'M6', 1.0),    # CMFB mirror 1:1
+    ('M17', 'M18', 1.0),  # NMOS bottom 4x 1:1
+    ('M19', 'M20', 1.0),  # NMOS bottom 8x 1:1
+    ('M19', 'M17', 2.0),  # NMOS 8x = 2 x 4x
+    ('M21', 'M22', 1.0),  # Stage 2 load 1:1
+]
+
+
+def build_mirror_pair_indices(
+    mosfet_device_names: List[str],
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    """Build index tensors for hardcoded 3-stage mirror pairs.
+
+    Args:
+        mosfet_device_names: List of MOSFET device names from graph builder.
+
+    Returns:
+        indices: [N_pairs, 2] MOSFET indices for each pair
+        ratios: [N_pairs] expected current ratio |Id(A)| = ratio * |Id(B)|
+        names: List of pair names for logging (e.g. 'M0=M1')
+    """
+    name_to_idx = {}
+    for i, n in enumerate(mosfet_device_names):
+        n_upper = n.upper()
+        name_to_idx[n_upper] = i
+        if n_upper.startswith('X'):
+            name_to_idx[n_upper[1:]] = i
+
+    indices, ratios, names = [], [], []
+    for dev_a, dev_b, ratio in OPAMP_3STAGE_MIRROR_PAIRS:
+        idx_a = name_to_idx.get(dev_a.upper(), -1)
+        idx_b = name_to_idx.get(dev_b.upper(), -1)
+        if idx_a != -1 and idx_b != -1:
+            indices.append([idx_a, idx_b])
+            ratios.append(ratio)
+            names.append(f"{dev_a}={'%.0f*' % ratio if ratio != 1.0 else ''}{dev_b}")
+
+    if indices:
+        return (torch.tensor(indices, dtype=torch.long),
+                torch.tensor(ratios, dtype=torch.float),
+                names)
+    return (torch.zeros((0, 2), dtype=torch.long),
+            torch.zeros(0, dtype=torch.float),
+            [])
+
+
+def compute_hardcoded_mirror_loss(
+    current_pred: torch.Tensor,
+    mosfet_info: torch.Tensor,
+    mirror_pair_indices: torch.Tensor,
+    mirror_pair_ratios: torch.Tensor,
+    mirror_pair_names: List[str],
+    ptr: torch.Tensor,
+    current_std: float,
+    pair_weights: Optional[Dict[int, float]] = None,
+    mosfet_ptr: torch.Tensor = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """MSE loss in normalized log10 z-score space for hardcoded mirror pairs.
+
+    For 1:1 pairs: MSE(pred_a, pred_b)
+    For ratio pairs: MSE(pred_a, pred_b + log10(ratio)/current_std)
+
+    Args:
+        current_pred: [N_nodes] normalized log10 z-score current predictions
+        mosfet_info: [num_mosfets, 7] MOSFET terminal info
+        mirror_pair_indices: [N_pairs, 2] MOSFET indices per pair
+        mirror_pair_ratios: [N_pairs] expected ratios
+        mirror_pair_names: List of pair names for logging
+        ptr: [batch_size+1] graph node boundaries
+        current_std: Std of log10 current normalization (for ratio offset)
+        pair_weights: Optional per-pair weight overrides {pair_idx: weight}
+        mosfet_ptr: [batch_size+1] MOSFET boundaries (None for fixed topology)
+
+    Returns:
+        (total_loss, {pair_name: loss_value})
+    """
+    if mirror_pair_indices is None or len(mirror_pair_indices) == 0:
+        return torch.tensor(0.0, device=current_pred.device), {}
+
+    device = current_pred.device
+    num_pairs = len(mirror_pair_indices)
+    num_mosfets_total = len(mosfet_info)
+    num_graphs = len(ptr) - 1
+    mosfets_per_graph = num_mosfets_total // num_graphs
+
+    # Precompute per-graph offsets (vectorized, no Python loop over graphs)
+    graph_idx = torch.arange(num_graphs, device=device)
+    if mosfet_ptr is not None:
+        m_offsets = mosfet_ptr[:-1].to(device)  # [num_graphs]
+    else:
+        m_offsets = graph_idx * mosfets_per_graph  # [num_graphs]
+    n_offsets = ptr[:-1].to(device)  # [num_graphs]
+
+    per_pair_losses = {}
+    total_loss = torch.tensor(0.0, device=device)
+
+    for p in range(num_pairs):
+        idx_a = mirror_pair_indices[p, 0]
+        idx_b = mirror_pair_indices[p, 1]
+        ratio = mirror_pair_ratios[p].item()
+        offset = math.log10(ratio) / current_std if ratio != 1.0 else 0.0
+
+        # Vectorized gather across all graphs
+        drain_a_idx = mosfet_info[m_offsets + idx_a, 1] + n_offsets  # [num_graphs]
+        drain_b_idx = mosfet_info[m_offsets + idx_b, 1] + n_offsets  # [num_graphs]
+        pred_a = current_pred[drain_a_idx]  # [num_graphs]
+        pred_b = current_pred[drain_b_idx]  # [num_graphs]
+
+        pair_loss = ((pred_a - pred_b - offset) ** 2).mean()
+        weight = pair_weights.get(p, 1.0) if pair_weights else 1.0
+        total_loss = total_loss + weight * pair_loss
+        per_pair_losses[mirror_pair_names[p]] = pair_loss.item()
+
+    # Sum, not average — each pair contributes independently so worse pairs
+    # naturally produce stronger gradients.
+    return total_loss, per_pair_losses
 
 
 def create_constraint_tensors(

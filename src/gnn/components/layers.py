@@ -9,6 +9,15 @@ import torch.nn as nn
 import torch_geometric.nn as PyGnn
 
 
+def get_activation(act_type: str = 'relu') -> nn.Module:
+    """Return activation module by name. Default: ReLU."""
+    if act_type == 'gelu':
+        return nn.GELU()
+    elif act_type == 'silu':
+        return nn.SiLU()
+    return nn.ReLU()
+
+
 def build_mlp(
     num_layers: int,
     input_dim: int,
@@ -16,6 +25,7 @@ def build_mlp(
     output_dim: int,
     norm_type: str = 'layer',
     dropout: float = 0.0,
+    act_type: str = 'relu',
 ) -> nn.Module:
     """
     Build an MLP for prediction heads.
@@ -44,7 +54,7 @@ def build_mlp(
     # First layer
     layers.append(nn.Linear(input_dim, hidden_dim))
     layers.append(make_norm())
-    layers.append(nn.ReLU())
+    layers.append(get_activation(act_type))
     if dropout > 0:
         layers.append(nn.Dropout(dropout))
 
@@ -52,7 +62,7 @@ def build_mlp(
     for _ in range(num_layers - 2):
         layers.append(nn.Linear(hidden_dim, hidden_dim))
         layers.append(make_norm())
-        layers.append(nn.ReLU())
+        layers.append(get_activation(act_type))
         if dropout > 0:
             layers.append(nn.Dropout(dropout))
 
@@ -68,6 +78,7 @@ def create_deepgcn_layer(
     norm_type: str = 'layer',
     dropout: float = 0.0,
     edge_dim: int = None,
+    act_type: str = 'relu',
 ) -> PyGnn.DeepGCNLayer:
     """
     Create a DeepGCNLayer with GENConv.
@@ -97,6 +108,6 @@ def create_deepgcn_layer(
     else:
         norm = nn.LayerNorm(hidden_dim)
 
-    act = nn.ReLU()
+    act = get_activation(act_type)
 
     return PyGnn.DeepGCNLayer(conv, norm, act, block='res+', dropout=dropout)

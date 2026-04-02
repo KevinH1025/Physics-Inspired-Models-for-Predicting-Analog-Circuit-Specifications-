@@ -50,6 +50,8 @@ def plot_training_curves(
     avg_grad_norms: List[float] = None,
     num_train_batches: int = 0,
     num_val_batches: int = 0,
+    train_mirror_losses: List[float] = None,
+    val_mirror_losses: List[float] = None,
 ) -> None:
     """Generate and save training curves plot."""
     num_epochs = len(train_losses)
@@ -62,7 +64,8 @@ def plot_training_curves(
     n_ac_plots = len(train_ac_component_losses) if (has_ac and train_ac_component_losses) else (1 if has_ac else 0)
     n_kcl_ac_plots = (1 if has_kcl else 0) + n_ac_plots + (1 if has_region else 0)
     has_dc_gain = train_dc_gain_losses and any(v > 0 for v in train_dc_gain_losses)
-    n_kcl_ac_plots += (1 if has_dc_gain else 0)
+    has_mirror = train_mirror_losses and any(v > 0 for v in train_mirror_losses)
+    n_kcl_ac_plots += (1 if has_dc_gain else 0) + (1 if has_mirror else 0)
     has_kcl_ac = n_kcl_ac_plots > 0
     # Need extra row if KCL+AC plots exceed 4 columns
     kcl_ac_rows = max(1, (n_kcl_ac_plots + 3) // 4) if has_kcl_ac else 0
@@ -236,6 +239,17 @@ def plot_training_curves(
             ax.set_xlabel('Epoch')
             ax.set_ylabel('DC Gain Loss (MSE)')
             ax.set_title('DC Gain Loss')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        if has_mirror:
+            ax = _next_ax()
+            ax.semilogy(train_epochs, train_mirror_losses, 'b-', label='Train', alpha=0.7)
+            if val_mirror_losses:
+                ax.semilogy(val_epochs, val_mirror_losses, 'r-', label='Val', alpha=0.7)
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Mirror Loss (MSE)')
+            ax.set_title('Mirror Pair Loss')
             ax.legend()
             ax.grid(True, alpha=0.3)
 

@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .current_constraints import compute_current_constraint_loss
+from .current_constraints import compute_current_constraint_loss, compute_hardcoded_mirror_loss
 
 
 def get_device_graph_idx(num_devices: int, num_graphs: int,
@@ -1198,6 +1198,115 @@ def compute_ss_loss(
     return gm_loss, gds_loss
 
 
+def compute_gm_id_consistency_loss(
+    gm_pred: torch.Tensor,
+    current_pred: torch.Tensor,
+    mosfet_info: torch.Tensor,
+    node_current_targets: torch.Tensor,
+    mosfet_gm: torch.Tensor,
+    gm_mean: float,
+    gm_std: float,
+    current_mean: float,
+    current_std: float,
+    ptr: torch.Tensor,
+    mosfet_ptr: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Consistency loss: log10(gm/Id) predicted vs ground truth.
+
+    Ensures gm and I_d predictions are mutually consistent via their ratio.
+    Operates in log10 space: log10(gm) - log10(|Id|).
+
+    Args:
+        gm_pred: [num_mosfets] z-scored log10(gm) from SS head
+        current_pred: [num_nodes] z-scored log10(|I|) from current head
+        mosfet_info: [num_mosfets, 7] MOSFET info (col 1 = drain terminal idx)
+        node_current_targets: [num_nodes] z-scored log10(|I|) ground truth
+        mosfet_gm: [num_mosfets] raw gm (linear scale)
+        gm_mean/gm_std: z-score stats for log10(gm)
+        current_mean/current_std: z-score stats for log10(|I|)
+        ptr: node boundaries per graph
+        mosfet_ptr: cumulative MOSFET counts per graph
+    """
+    device = gm_pred.device
+    num_mosfets = mosfet_info.shape[0]
+    drain_idx = mosfet_info[:, 1].long()
+
+    # Compute per-MOSFET node offsets for batched graphs
+    num_graphs = ptr.shape[0] - 1
+    if mosfet_ptr is not None:
+        mg_idx = torch.bucketize(
+            torch.arange(num_mosfets, device=device),
+            mosfet_ptr[1:].to(device), right=True,
+        )
+    else:
+        devices_per_graph = num_mosfets // num_graphs
+        mg_idx = torch.arange(num_mosfets, device=device) // devices_per_graph
+    offsets = ptr[mg_idx]
+
+    # Predicted log10(gm) and log10(|Id|) at drain terminals
+    pred_log_gm = gm_pred * gm_std + gm_mean
+    pred_log_id = current_pred[drain_idx + offsets] * current_std + current_mean
+    pred_ratio = pred_log_gm - pred_log_id
+
+    # Ground truth log10(gm/Id)
+    mosfet_gm = mosfet_gm.to(device)
+    valid = mosfet_gm > 1e-12
+    gt_log_gm = torch.log10(mosfet_gm.clamp(min=1e-20))
+    gt_log_id = node_current_targets.to(device)[drain_idx + offsets] * current_std + current_mean
+    gt_ratio = gt_log_gm - gt_log_id
+
+    valid = valid & torch.isfinite(gt_ratio) & torch.isfinite(pred_ratio)
+    if valid.any():
+        return F.mse_loss(pred_ratio[valid], gt_ratio[valid])
+    return torch.tensor(0.0, device=device)
+
+
+def compute_gm_id_aux_loss(
+    gm_id_pred: torch.Tensor,
+    mosfet_gm: torch.Tensor,
+    node_current_targets: torch.Tensor,
+    mosfet_info: torch.Tensor,
+    current_mean: float,
+    current_std: float,
+    gm_id_mean: float,
+    gm_id_std: float,
+    ptr: torch.Tensor,
+    mosfet_ptr: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Auxiliary loss for per-MOSFET log10(gm/Id) prediction.
+
+    Target: z-scored log10(gm/Id) = (log10(gm) - log10(|Id|) - mean) / std.
+    """
+    device = gm_id_pred.device
+    num_mosfets = mosfet_info.shape[0]
+    drain_idx = mosfet_info[:, 1].long()
+
+    num_graphs = ptr.shape[0] - 1
+    if mosfet_ptr is not None:
+        mg_idx = torch.bucketize(
+            torch.arange(num_mosfets, device=device),
+            mosfet_ptr[1:].to(device), right=True,
+        )
+    else:
+        devices_per_graph = num_mosfets // num_graphs
+        mg_idx = torch.arange(num_mosfets, device=device) // devices_per_graph
+    offsets = ptr[mg_idx]
+
+    mosfet_gm = mosfet_gm.to(device)
+    valid = mosfet_gm > 1e-12
+    gt_log_gm = torch.log10(mosfet_gm.clamp(min=1e-20))
+    gt_log_id = node_current_targets.to(device)[drain_idx + offsets] * current_std + current_mean
+    gt_gm_id = gt_log_gm - gt_log_id
+    gt_z = (gt_gm_id - gm_id_mean) / max(gm_id_std, 1e-6)
+
+    valid = valid & torch.isfinite(gt_z)
+    if valid.any():
+        return F.mse_loss(gm_id_pred[valid], gt_z[valid])
+    return torch.tensor(0.0, device=device)
+
+
 # IV Model ID Prediction Loss
 def compute_iv_id_loss(
     log_abs_id_pred: torch.Tensor,
@@ -1586,8 +1695,20 @@ def compute_combined_loss(
     dc_gain_target: torch.Tensor = None,
     dc_gain_mean: float = 0.0,
     dc_gain_std: float = 1.0,
+    # gm/Id consistency loss
+    gm_id_consistency_weight: float = 0.0,
+    node_current_targets: torch.Tensor = None,
+    # gm/Id auxiliary prediction loss
+    gm_id_aux_weight: float = 0.0,
+    gm_id_pred: torch.Tensor = None,
+    gm_id_mean: float = 0.0,
+    gm_id_std: float = 1.0,
     # Uncertainty weighting
     uncertainty_weights = None,
+    # Hardcoded mirror pair loss
+    mirror_pair_indices: torch.Tensor = None,
+    mirror_pair_ratios: torch.Tensor = None,
+    mirror_pair_names: list = None,
 ) -> tuple:
     """
     Compute combined loss from all components.
@@ -1735,6 +1856,21 @@ def compute_combined_loss(
         )
 
     constraint_loss = diff_pair_loss + mirror_loss + output_stage_loss + lambda_mirror_loss
+
+    # Hardcoded mirror pair loss (MSE in normalized space)
+    hardcoded_mirror_loss = torch.tensor(0.0, device=voltage_loss.device)
+    mirror_pair_losses = {}
+    if constraint_weight > 0 and current_pred is not None and mosfet_info is not None and mirror_pair_indices is not None and len(mirror_pair_indices) > 0:
+        hardcoded_mirror_loss, mirror_pair_losses = compute_hardcoded_mirror_loss(
+            current_pred=current_pred,
+            mosfet_info=mosfet_info,
+            mirror_pair_indices=mirror_pair_indices,
+            mirror_pair_ratios=mirror_pair_ratios,
+            mirror_pair_names=mirror_pair_names,
+            ptr=ptr,
+            current_std=current_std,
+            mosfet_ptr=mosfet_ptr,
+        )
 
     # gm physics self-consistency loss
     gm_physics_loss = torch.tensor(0.0, device=voltage_loss.device)
@@ -1903,6 +2039,28 @@ def compute_combined_loss(
         dc_gain_target_z = (dc_gain_target - dc_gain_mean) / max(dc_gain_std, 1e-6)
         dc_gain_loss = F.mse_loss(dc_gain_pred, dc_gain_target_z)
 
+    # gm/Id consistency loss
+    gm_id_loss = torch.tensor(0.0, device=voltage_pred.device)
+    if gm_id_consistency_weight > 0 and ss_gm_pred is not None and current_pred is not None and mosfet_info is not None and node_current_targets is not None and mosfet_gm is not None:
+        gm_id_loss = compute_gm_id_consistency_loss(
+            gm_pred=ss_gm_pred, current_pred=current_pred.float(),
+            mosfet_info=mosfet_info, node_current_targets=node_current_targets,
+            mosfet_gm=mosfet_gm, gm_mean=ss_gm_mean, gm_std=ss_gm_std,
+            current_mean=current_mean, current_std=current_std,
+            ptr=ptr, mosfet_ptr=mosfet_ptr,
+        )
+
+    # gm/Id auxiliary prediction loss
+    gm_id_aux_loss = torch.tensor(0.0, device=voltage_pred.device)
+    if gm_id_aux_weight > 0 and gm_id_pred is not None and mosfet_info is not None and node_current_targets is not None and mosfet_gm is not None:
+        gm_id_aux_loss = compute_gm_id_aux_loss(
+            gm_id_pred=gm_id_pred, mosfet_gm=mosfet_gm,
+            node_current_targets=node_current_targets,
+            mosfet_info=mosfet_info, current_mean=current_mean, current_std=current_std,
+            gm_id_mean=gm_id_mean, gm_id_std=gm_id_std,
+            ptr=ptr, mosfet_ptr=mosfet_ptr,
+        )
+
     if uncertainty_weights is not None:
         # Normalized uncertainty weighting (Kendall et al. 2018, weights sum to N_tasks)
         uw = uncertainty_weights.get_weights()
@@ -1930,7 +2088,10 @@ def compute_combined_loss(
                                    device_consistency_weight * dev_consistency_loss +
                                    kcl_intermediate_weight * kcl_intermediate_loss +
                                    iv_id_loss_weight * iv_id_loss +
-                                   dc_gain_loss_weight * dc_gain_loss)
+                                   dc_gain_loss_weight * dc_gain_loss +
+                                   gm_id_consistency_weight * gm_id_loss +
+                                   gm_id_aux_weight * gm_id_aux_loss +
+                                   constraint_weight * hardcoded_mirror_loss)
     else:
         total_loss = (voltage_weight * voltage_loss +
                       current_weight * current_loss +
@@ -1948,6 +2109,9 @@ def compute_combined_loss(
                       vov_loss_weight * vov_loss +
                       vth_loss_weight * vth_loss +
                       iv_id_loss_weight * iv_id_loss +
-                      dc_gain_loss_weight * dc_gain_loss)
+                      dc_gain_loss_weight * dc_gain_loss +
+                      gm_id_consistency_weight * gm_id_loss +
+                      gm_id_aux_weight * gm_id_aux_loss +
+                      constraint_weight * hardcoded_mirror_loss)
 
-    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss
+    return total_loss, voltage_loss, current_loss, kcl_loss, diff_pair_loss, mirror_loss, output_stage_loss, lambda_mirror_loss, gm_physics_loss, ac_loss, ss_gm_loss, ss_gds_loss, triode_physics_loss, triode_eq1_loss, triode_eq2_loss, triode_eq3_loss, region_loss, cutoff_physics_loss, kcl_intermediate_loss, vov_loss, vth_loss, iv_id_loss, ac_per_component, dc_gain_loss, gm_id_loss, gm_id_aux_loss, hardcoded_mirror_loss, mirror_pair_losses

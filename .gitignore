@@ -22,6 +22,7 @@ Thumbs.db
 
 # Generated plots
 plots/
+configs/
 
 # PyTorch checkpoints
 *.pt
