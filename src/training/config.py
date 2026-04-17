@@ -42,6 +42,10 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['layers'] = model_cfg.get('num_layers', 15)
     args['dropout'] = model_cfg.get('dropout', 0.0)
     args['genconv_num_layers'] = model_cfg.get('genconv_num_layers', 2)
+    args['conv_type'] = model_cfg.get('conv_type', 'genconv')
+    args['conv_num_heads'] = model_cfg.get('conv_num_heads', 4)
+    args['mlp_expansion'] = model_cfg.get('mlp_expansion', 2)
+    args['mlp_depth'] = model_cfg.get('mlp_depth', 2)
     args['norm_type'] = model_cfg.get('norm_type', 'layer')
     args['act_type'] = model_cfg.get('act_type', 'relu')
     args['skip_connection'] = model_cfg.get('skip_connection', True)
@@ -167,6 +171,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'use_device_context': dc_gain_cfg.get('use_device_context', False),
         'device_proj_dim': dc_gain_cfg.get('device_proj_dim', 32),
         'rout1_formula': dc_gain_cfg.get('rout1_formula', 'cascode'),
+        'use_voltage_context': dc_gain_cfg.get('use_voltage_context', False),
     }
 
     # gm/Id auxiliary prediction head
@@ -209,6 +214,8 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'expert_hidden_dim': ss_head_cfg.get('expert_hidden_dim', 256),
         'expert_num_layers': ss_head_cfg.get('expert_num_layers', 2),
         'predict_gm_id': ss_head_cfg.get('predict_gm_id', False),
+        'subcircuit_heads': ss_head_cfg.get('subcircuit_heads', False),
+        'subcircuit_groups': ss_head_cfg.get('subcircuit_groups', None),
     }
     # Differentiable I-V model config (nested under ss head)
     iv_cfg = ss_head_cfg.get('iv_model', {})
@@ -244,6 +251,16 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'hidden_dim': region_head_cfg.get('hidden_dim', model_cfg.get('hidden_dim', 128)),
         'num_layers': region_head_cfg.get('num_layers', 1),
         'dropout': region_head_cfg.get('dropout', 0.0),
+    }
+
+    # Vgs/Vds prediction head
+    vgsvds_cfg = heads_cfg.get('vgsvds', {})
+    args['vgsvds_config'] = {
+        'enabled': vgsvds_cfg.get('enabled', False),
+        'hidden_dim': vgsvds_cfg.get('hidden_dim', 512),
+        'num_layers': vgsvds_cfg.get('num_layers', 2),
+        'dropout': vgsvds_cfg.get('dropout', 0.0),
+        'detach': vgsvds_cfg.get('detach', True),
     }
 
     # Refinement pass (two-pass architecture)
@@ -284,6 +301,18 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
         'pool_mode': loop_attn_cfg.get('pool_mode', 'mean'),
     }
 
+    # Subcircuit DAG config
+    sc_dag_cfg = tower_cfg.get('subcircuit_dag', {})
+    args['subcircuit_dag_config'] = {
+        'enabled': sc_dag_cfg.get('enabled', False),
+        'dim': sc_dag_cfg.get('dim', 128),
+        'num_heads': sc_dag_cfg.get('num_heads', 4),
+        'groups': sc_dag_cfg.get('groups', None),
+        'edges': sc_dag_cfg.get('edges', None),
+        'warmup_epochs': sc_dag_cfg.get('warmup_epochs', 0),
+        'warmup_duration': sc_dag_cfg.get('warmup_duration', 0),
+    }
+
     # Loss - support both nested and flat formats
     loss_cfg = config.get('loss', {})
     train_cfg_preview = config.get('training', {})
@@ -304,6 +333,7 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     args['kcl_mode'] = loss_cfg.get('kcl_mode', 'logsumexp')  # logsumexp, z_diff, denorm
     args['kcl_exclusive'] = loss_cfg.get('kcl_exclusive', False)  # exclude KCL terminals from current MSE
     args['kcl_detach_backbone'] = loss_cfg.get('kcl_detach_backbone', False)  # stop KCL gradient to backbone
+    args['kcl_mask_unsupervised'] = loss_cfg.get('kcl_mask_unsupervised', True)  # exclude unsupervised terminals from KCL
     args['kcl_violation_threshold'] = loss_cfg.get('kcl_violation_threshold', 0.0)  # min relative violation to penalize
     args['kcl_huber_delta'] = loss_cfg.get('kcl_huber_delta', 0.0)  # 0 = disabled (use MSE), >0 = Huber delta for 3-term KCL
     args['kcl_gt_filter'] = loss_cfg.get('kcl_gt_filter', 0.1)  # max GT relative violation for multi-term nets (0 = disabled)
@@ -382,6 +412,14 @@ def parse_training_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # gm/Id auxiliary loss
     gm_id_aux_cfg = loss_cfg.get('gm_id_aux', {})
     args['gm_id_aux_weight'] = gm_id_aux_cfg.get('weight', 0.0)
+
+    # Vgs/Vds auxiliary loss (net voltage consistency)
+    vdiff_cfg = loss_cfg.get('vdiff_loss', {})
+    args['vdiff_loss_weight'] = vdiff_cfg.get('weight', 0.0)
+
+    # Vgs/Vds head loss (supervised per-device)
+    vgsvds_loss_cfg = loss_cfg.get('vgsvds_loss', {})
+    args['vgsvds_loss_weight'] = vgsvds_loss_cfg.get('weight', 0.0)
 
     # Device consistency loss
     args['device_consistency_weight'] = loss_cfg.get('device_consistency_weight', 0.0)

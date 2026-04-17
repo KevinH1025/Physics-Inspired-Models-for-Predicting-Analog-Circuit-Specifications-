@@ -7,6 +7,8 @@ then splits into:
   - Sensitivity tower (2 layers): predicts gm and gds
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,8 +17,86 @@ from typing import Dict, Optional
 
 from ..registry import register_model
 from ..components.layers import build_mlp, create_deepgcn_layer, get_activation
+
+_LN10 = 2.302585092994046  # math.log(10)
+
+def log10_add(log_a: torch.Tensor, log_b: torch.Tensor) -> torch.Tensor:
+    """Compute log10(10^log_a + 10^log_b) in a numerically stable way."""
+    return torch.logaddexp(log_a * _LN10, log_b * _LN10) / _LN10
 from ..components.virtual_node import VirtualNode
 from .base import BaseGNN
+
+
+# Default 3-stage opamp subcircuit groups (mosfet_info indices)
+DEFAULT_SUBCIRCUIT_GROUPS = {
+    'bias_pmos': [0, 1, 2, 3, 4, 7],
+    'cmfb': [5, 6],
+    'diff_pair': [8, 9],
+    'cascode': [12, 13, 10, 11],
+    'bias_nmos': [14, 16, 18, 15, 17],
+    'stage2': [19, 20, 21],
+    'output': [22, 23],
+}
+
+# Default DAG edges: parent → child (forward signal flow)
+# Map: bias_pmos=0, cmfb=1, diff_pair=2, cascode=3, bias_nmos=4, stage2=5, output=6
+DEFAULT_DAG_EDGES = [
+    (0, 1),  # bias_pmos → cmfb
+    (0, 2),  # bias_pmos → diff_pair
+    (0, 3),  # bias_pmos → cascode
+    (4, 3),  # bias_nmos → cascode
+    (1, 3),  # cmfb → cascode
+    (2, 3),  # diff_pair → cascode
+    (0, 5),  # bias_pmos → stage2
+    (3, 5),  # cascode → stage2
+    (3, 6),  # cascode → output
+    (5, 6),  # stage2 → output
+]
+
+
+class SubcircuitAttentionPool(nn.Module):
+    """Multi-head attention pooling for subcircuit terminal embeddings.
+
+    Learnable query tokens attend over variable-length terminal embeddings
+    to produce a fixed-size subcircuit representation.
+    """
+
+    def __init__(self, input_dim: int = 128, output_dim: int = 128, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = output_dim // num_heads
+        self.output_dim = output_dim
+        self.queries = nn.Parameter(torch.randn(1, num_heads, self.head_dim) * 0.02)
+        self.key_proj = nn.Linear(input_dim, self.head_dim)
+        self.value_proj = nn.Linear(input_dim, self.head_dim)
+        self.output_proj = nn.Linear(output_dim, output_dim)
+        self.norm = nn.LayerNorm(output_dim)
+        self._scale = self.head_dim ** -0.5
+
+    def forward(self, terminal_embs: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        """Pool terminal embeddings to subcircuit embedding.
+
+        Args:
+            terminal_embs: [B, T, input_dim] padded terminal embeddings
+            mask: [B, T] bool, True for valid terminals
+
+        Returns:
+            [B, output_dim] subcircuit embeddings
+        """
+        B, T, _ = terminal_embs.shape
+        K = self.key_proj(terminal_embs)   # [B, T, head_dim]
+        V = self.value_proj(terminal_embs)  # [B, T, head_dim]
+        Q = self.queries.expand(B, -1, -1)  # [B, num_heads, head_dim]
+
+        scores = torch.bmm(Q, K.transpose(1, 2)) * self._scale  # [B, num_heads, T]
+        if mask is not None:
+            scores = scores.masked_fill(~mask.unsqueeze(1), float('-inf'))
+        weights = torch.softmax(scores, dim=-1)
+
+        out = torch.bmm(weights, V)  # [B, num_heads, head_dim]
+        out = out.reshape(B, self.output_dim)
+        out = self.norm(self.output_proj(out))
+        return out
 
 
 class JKAggregation(nn.Module):
@@ -35,12 +115,21 @@ class JKAggregation(nn.Module):
         super().__init__()
         self.mode = mode
         self.attention = attention
+        self.per_feature = (mode == 'attention')  # per-feature softmax across layers
         self.hidden_dim = hidden_dim
         self.num_outputs = num_outputs
         self.gated_residual = gated_residual
         self.act_type = act_type
 
-        if gated_residual:
+        if self.per_feature:
+            # Per-feature softmax: each feature independently picks its layer mix
+            self.attn = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                get_activation(self.act_type),
+                nn.Linear(hidden_dim // 2, hidden_dim),
+            )
+            self.linear = None
+        elif gated_residual:
             # Attention over layers 0..N-2, gated addition to last layer
             n_early = max(num_outputs - 1, 1)
             self.attn = nn.Sequential(
@@ -89,6 +178,12 @@ class JKAggregation(nn.Module):
             else:
                 x = x_last
             return x
+
+        if self.per_feature:
+            layer_stack = torch.stack(layer_outputs, dim=0)  # [L, N, H]
+            attn_scores = self.attn(layer_stack)              # [L, N, H]
+            attn_weights = F.softmax(attn_scores, dim=0)      # [L, N, H] sums to 1 across layers
+            return (attn_weights * layer_stack).sum(dim=0)     # [N, H]
 
         if self.attention:
             layer_stack = torch.stack(layer_outputs, dim=0)
@@ -345,6 +440,10 @@ class TowerGENConv(BaseGNN):
         self.hidden_dim = hidden_dim
         self.node_feature_dim = node_feature_dim
         self.act_type = kwargs.get('act_type', 'relu')
+        self.conv_type = kwargs.get('conv_type', 'genconv')
+        self.conv_num_heads = kwargs.get('conv_num_heads', 4)
+        self.mlp_expansion = kwargs.get('mlp_expansion', 2)
+        self.mlp_depth = kwargs.get('mlp_depth', 2)
         self.skip_connection = skip_connection
         self.predict_currents = predict_currents
         self.use_device_pooling_current = use_device_pooling_current
@@ -372,7 +471,7 @@ class TowerGENConv(BaseGNN):
 
         # --- Backbone layers ---
         self.backbone = nn.ModuleList([
-            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
+            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type, conv_type=self.conv_type, num_heads=self.conv_num_heads, mlp_expansion=self.mlp_expansion, mlp_depth=self.mlp_depth)
             for _ in range(backbone_layers)
         ])
 
@@ -433,13 +532,15 @@ class TowerGENConv(BaseGNN):
 
         # --- State Tower (V/I) ---
         self.state_tower = nn.ModuleList([
-            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
+            create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type, conv_type=self.conv_type, num_heads=self.conv_num_heads, mlp_expansion=self.mlp_expansion, mlp_depth=self.mlp_depth)
             for _ in range(state_tower_layers)
         ])
 
+        self.unified_state_jk = state_tower_jk_config.get('unified', False)
+        _state_jk_num = (backbone_layers + 1 + state_tower_layers) if self.unified_state_jk else (state_tower_layers + 1)
         self.state_jk = JKAggregation(
             hidden_dim=hidden_dim,
-            num_outputs=state_tower_layers + 1,
+            num_outputs=_state_jk_num,
             mode=state_tower_jk_config.get('mode', 'last'),
             attention=state_tower_jk_config.get('attention', False),
             learn_temperature=state_tower_jk_config.get('learn_temperature', False),
@@ -456,6 +557,20 @@ class TowerGENConv(BaseGNN):
         v_dropout = voltage_head_config.get('dropout', 0.0)
         self.voltage_head = build_mlp(v_layers, mlp_input_dim, v_hidden, 1, norm_type, v_dropout, act_type=self.act_type)
 
+        # Vgs/Vds prediction head (optional)
+        vgsvds_cfg = kwargs.get('vgsvds_config', {})
+        self.predict_vgsvds = vgsvds_cfg.get('enabled', False)
+        if self.predict_vgsvds:
+            vd_hidden = vgsvds_cfg.get('hidden_dim', 512)
+            vd_layers = vgsvds_cfg.get('num_layers', 2)
+            vd_dropout = vgsvds_cfg.get('dropout', 0.0)
+            vd_input_dim = 3 * mlp_input_dim  # G+D+S terminal embeddings
+            self.vgsvds_head = build_mlp(vd_layers, vd_input_dim, vd_hidden, 2,
+                                          norm_type, vd_dropout, act_type=self.act_type)
+            self.vgsvds_detach = vgsvds_cfg.get('detach', True)
+        else:
+            self.vgsvds_head = None
+
         # Current head (optional)
         self.use_autograd_ss = current_head_config.get('autograd_ss', False) and use_device_pooling_current
         if predict_currents:
@@ -464,6 +579,7 @@ class TowerGENConv(BaseGNN):
                 c_hidden = current_head_config.get('hidden_dim', 256)
                 c_layers = current_head_config.get('num_layers', 2)
                 c_dropout = current_head_config.get('dropout', 0.0)
+                c_all_terminals = current_head_config.get('all_terminals', False)
                 self.device_current_head = DevicePoolingCurrentHead(
                     embed_dim=mlp_input_dim,
                     hidden_dim=c_hidden,
@@ -471,6 +587,7 @@ class TowerGENConv(BaseGNN):
                     dropout=c_dropout,
                     norm_type=norm_type,
                     voltage_input=self.use_autograd_ss,
+                    all_terminals=c_all_terminals,
                 )
                 self.current_head = None
                 self.aux_current_head = None
@@ -602,13 +719,15 @@ class TowerGENConv(BaseGNN):
                 self.ss_branch_layers = ss_head_config.get('sensitivity_branch_layers', 0)
 
                 self.sensitivity_tower = nn.ModuleList([
-                    create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
+                    create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type, conv_type=self.conv_type, num_heads=self.conv_num_heads, mlp_expansion=self.mlp_expansion, mlp_depth=self.mlp_depth)
                     for _ in range(sensitivity_tower_layers)
                 ])
 
+                self.unified_sensitivity_jk = sensitivity_tower_jk_config.get('unified', False)
+                _sens_jk_num = (backbone_layers + 1 + sensitivity_tower_layers) if self.unified_sensitivity_jk else (sensitivity_tower_layers + 1)
                 self.sensitivity_jk = JKAggregation(
                     hidden_dim=hidden_dim,
-                    num_outputs=sensitivity_tower_layers + 1,
+                    num_outputs=_sens_jk_num,
                     mode=sensitivity_tower_jk_config.get('mode', 'last'),
                     attention=sensitivity_tower_jk_config.get('attention', False),
                     learn_temperature=sensitivity_tower_jk_config.get('learn_temperature', False),
@@ -619,11 +738,11 @@ class TowerGENConv(BaseGNN):
                 # Y-shaped branches: separate gm/gds GNN layers after shared sensitivity tower
                 if self.ss_branch_layers > 0:
                     self.gm_branch = nn.ModuleList([
-                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
+                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type, conv_type=self.conv_type, num_heads=self.conv_num_heads, mlp_expansion=self.mlp_expansion, mlp_depth=self.mlp_depth)
                         for _ in range(self.ss_branch_layers)
                     ])
                     self.gds_branch = nn.ModuleList([
-                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type)
+                        create_deepgcn_layer(hidden_dim, genconv_num_layers, norm_type, dropout, edge_dim=edge_dim, act_type=self.act_type, conv_type=self.conv_type, num_heads=self.conv_num_heads, mlp_expansion=self.mlp_expansion, mlp_depth=self.mlp_depth)
                         for _ in range(self.ss_branch_layers)
                     ])
                     self.gm_branch_jk = JKAggregation(
@@ -742,7 +861,11 @@ class TowerGENConv(BaseGNN):
                 self.gds_head = _build_ss_head(gds_input_dim, ss_hidden, ss_layers, ss_dropout)
             else:
                 # Base input: gate + drain + source [+ bulk] [+ difference] [+ 3 pairwise] from sensitivity tower
-                n_terms = 3 + (1 if self.ss_include_bulk else 0) + (1 if self.ss_diff_features else 0) + (3 if self.ss_pairwise else 0)
+                self.ss_drain_only = ss_head_config.get('drain_only', False)
+                if self.ss_drain_only:
+                    n_terms = 1  # drain only
+                else:
+                    n_terms = 3 + (1 if self.ss_include_bulk else 0) + (1 if self.ss_diff_features else 0) + (3 if self.ss_pairwise else 0)
                 ss_input_dim = n_terms * mlp_input_dim + ctx_dim
 
                 # State context: detached summary of state tower terminal embeddings
@@ -784,8 +907,32 @@ class TowerGENConv(BaseGNN):
                 else:
                     self.gm_experts = None
                     self.gds_experts = None
-                    self.gm_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
-                    self.gds_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
+                    # Subcircuit-conditioned heads: separate gm/gds MLP per subcircuit
+                    self.use_subcircuit_heads = ss_head_config.get('subcircuit_heads', False)
+                    if self.use_subcircuit_heads:
+                        default_groups = {
+                            'bias_pmos': [0, 1, 2, 3, 4, 7],
+                            'cmfb': [5, 6],
+                            'diff_pair': [8, 9],
+                            'cascode': [12, 13, 10, 11],
+                            'bias_nmos': [14, 16, 18, 15, 17],
+                            'stage2': [19, 20, 21],
+                            'output': [22, 23],
+                        }
+                        self._subcircuit_groups = ss_head_config.get('subcircuit_groups', None) or default_groups
+                        self.subcircuit_gm_heads = nn.ModuleDict({
+                            name: _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
+                            for name in self._subcircuit_groups
+                        })
+                        self.subcircuit_gds_heads = nn.ModuleDict({
+                            name: _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
+                            for name in self._subcircuit_groups
+                        })
+                        self.gm_head = None
+                        self.gds_head = None
+                    else:
+                        self.gm_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
+                        self.gds_head = _build_ss_head(ss_input_dim, ss_hidden, ss_layers, ss_dropout)
 
             # Region prediction head (CORAL ordinal, under sensitivity tower)
             region_head_config = kwargs.get('region_head_config', None)
@@ -923,12 +1070,172 @@ class TowerGENConv(BaseGNN):
                         get_activation(self.act_type),
                         nn.Linear(128, ac_output_dim),
                     )
+                elif self.ac_readout == 'mosfet_physics':
+                    # UGBW physics formula in log space + correction MLP
+                    self.register_buffer('_ac_mosfet_indices', torch.tensor(
+                        [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                    self.ac_detach = ac_head_config.get('detach', True)
+                    if not hasattr(self, 'ss_gm_mean_buf'):
+                        self.register_buffer('ss_gm_mean_buf', torch.tensor(0.0))
+                        self.register_buffer('ss_gm_std_buf', torch.tensor(1.0))
+                        self.register_buffer('ss_gds_mean_buf', torch.tensor(0.0))
+                        self.register_buffer('ss_gds_std_buf', torch.tensor(1.0))
+                    r_in = float(ac_head_config.get('r_in', 50000.0))
+                    r_f = float(ac_head_config.get('r_f', 50000.0))
+                    if not hasattr(self, '_dc_r_in'):
+                        self.register_buffer('_dc_r_in', torch.tensor(r_in))
+                        self.register_buffer('_dc_r_f', torch.tensor(r_f))
+                    self._ac_cap_local_idx = 110  # C0 positive terminal (fixed topology)
+                    self._ac_cc_log10_min = math.log10(0.5e-12)
+                    self._ac_cc_log10_range = math.log10(30e-12) - math.log10(0.5e-12)
+                    ac_physics_dim = 30  # 14 z_gm + 14 z_gds + Cc_norm + log10_ugbw_est
+                    dc_hidden = ac_head_config.get('hidden_dim', 128)
+                    self.ac_head = nn.Sequential(
+                        nn.Linear(ac_physics_dim, dc_hidden),
+                        nn.LayerNorm(dc_hidden),
+                        get_activation(self.act_type),
+                        nn.Linear(dc_hidden, dc_hidden // 2),
+                        nn.LayerNorm(dc_hidden // 2),
+                        get_activation(self.act_type),
+                        nn.Linear(dc_hidden // 2, ac_output_dim),
+                    )
+                elif self.ac_readout == 'mosfet_physics_dag':
+                    # UGBW physics formula + DAG subcircuit embeddings
+                    self.register_buffer('_ac_mosfet_indices', torch.tensor(
+                        [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                    self.ac_detach = ac_head_config.get('detach', True)
+                    if not hasattr(self, 'ss_gm_mean_buf'):
+                        self.register_buffer('ss_gm_mean_buf', torch.tensor(0.0))
+                        self.register_buffer('ss_gm_std_buf', torch.tensor(1.0))
+                        self.register_buffer('ss_gds_mean_buf', torch.tensor(0.0))
+                        self.register_buffer('ss_gds_std_buf', torch.tensor(1.0))
+                    r_in = float(ac_head_config.get('r_in', 50000.0))
+                    r_f = float(ac_head_config.get('r_f', 50000.0))
+                    if not hasattr(self, '_dc_r_in'):
+                        self.register_buffer('_dc_r_in', torch.tensor(r_in))
+                        self.register_buffer('_dc_r_f', torch.tensor(r_f))
+                    self._ac_cap_local_idx = 110
+                    self._ac_cc_log10_min = math.log10(0.5e-12)
+                    self._ac_cc_log10_range = math.log10(30e-12) - math.log10(0.5e-12)
+                    # Physics (30) + DAG embeddings (7 × sc_dim)
+                    _sc_dag_cfg = kwargs.get('subcircuit_dag_config', {})
+                    sc_dim = _sc_dag_cfg.get('dim', 128)
+                    self._ac_dag_dim = 7 * sc_dim
+                    ac_physics_dim = 30 + self._ac_dag_dim
+                    self.ac_head = nn.Sequential(
+                        nn.Linear(ac_physics_dim, 512),
+                        nn.LayerNorm(512),
+                        get_activation(self.act_type),
+                        nn.Linear(512, 256),
+                        nn.LayerNorm(256),
+                        get_activation(self.act_type),
+                        nn.Linear(256, ac_output_dim),
+                    )
+                elif self.ac_readout == 'physics_dag_residual':
+                    # Physics UGBW estimate + DAG output stage residual correction
+                    self.register_buffer('_ac_mosfet_indices', torch.tensor(
+                        [8, 9, 5, 6, 12, 13, 10, 11, 7, 19, 20, 21, 22, 23], dtype=torch.long))
+                    self.ac_detach = True  # always detach gm/gds for physics part
+                    if not hasattr(self, 'ss_gm_mean_buf'):
+                        self.register_buffer('ss_gm_mean_buf', torch.tensor(0.0))
+                        self.register_buffer('ss_gm_std_buf', torch.tensor(1.0))
+                        self.register_buffer('ss_gds_mean_buf', torch.tensor(0.0))
+                        self.register_buffer('ss_gds_std_buf', torch.tensor(1.0))
+                    r_in = float(ac_head_config.get('r_in', 50000.0))
+                    r_f = float(ac_head_config.get('r_f', 50000.0))
+                    if not hasattr(self, '_dc_r_in'):
+                        self.register_buffer('_dc_r_in', torch.tensor(r_in))
+                        self.register_buffer('_dc_r_f', torch.tensor(r_f))
+                    self._ac_cap_local_idx = 110
+                    self._ac_cc_log10_min = math.log10(0.5e-12)
+                    self._ac_cc_log10_range = math.log10(30e-12) - math.log10(0.5e-12)
+                    # Physics correction MLP (same as mosfet_physics)
+                    ac_physics_dim = 30
+                    dc_hidden = ac_head_config.get('hidden_dim', 128)
+                    self.ac_head = nn.Sequential(
+                        nn.Linear(ac_physics_dim, dc_hidden),
+                        nn.LayerNorm(dc_hidden), get_activation(self.act_type),
+                        nn.Linear(dc_hidden, dc_hidden // 2),
+                        nn.LayerNorm(dc_hidden // 2), get_activation(self.act_type),
+                        nn.Linear(dc_hidden // 2, ac_output_dim),
+                    )
+                    # DAG residual correction from last subcircuit embedding
+                    _sc_dag_cfg = kwargs.get('subcircuit_dag_config', {})
+                    sc_dim = _sc_dag_cfg.get('dim', 128)
+                    self.ac_dag_correction = nn.Sequential(
+                        nn.Linear(sc_dim, 64),
+                        nn.LayerNorm(64), get_activation(self.act_type),
+                        nn.Linear(64, ac_output_dim),
+                    )
+                    # Init correction near zero so physics dominates initially
+                    nn.init.zeros_(self.ac_dag_correction[-1].weight)
+                    nn.init.zeros_(self.ac_dag_correction[-1].bias)
+                elif self.ac_readout == 'dag_only':
+                    # UGBW from last DAG subcircuit embedding (output stage, has upstream context)
+                    self.ac_detach = ac_head_config.get('detach', True)
+                    _sc_dag_cfg = kwargs.get('subcircuit_dag_config', {})
+                    sc_dim = _sc_dag_cfg.get('dim', 128)
+                    self.ac_head = nn.Sequential(
+                        nn.Linear(sc_dim, 256),
+                        nn.LayerNorm(256),
+                        get_activation(self.act_type),
+                        nn.Linear(256, 128),
+                        nn.LayerNorm(128),
+                        get_activation(self.act_type),
+                        nn.Linear(128, ac_output_dim),
+                    )
                 else:
                     # 'pool' fallback: mean+max pool of state_repr
                     ac_hidden = ac_head_config.get('hidden_dim', 128)
                     ac_layers = ac_head_config.get('num_layers', 3)
                     ac_input_dim = mlp_input_dim * 2  # mean+max pool
                     self.ac_head = build_mlp(ac_layers, ac_input_dim, ac_hidden, ac_output_dim, norm_type, ac_dropout, act_type=self.act_type)
+
+        # Subcircuit DAG (between backbone and towers)
+        sc_dag_config = kwargs.get('subcircuit_dag_config', {})
+        self.use_subcircuit_dag = sc_dag_config.get('enabled', False)
+        if self.use_subcircuit_dag:
+            self.sc_dag_warmup_epochs = sc_dag_config.get('warmup_epochs', 0)
+            self.sc_dag_warmup_duration = sc_dag_config.get('warmup_duration', 0)
+            sc_dim = sc_dag_config.get('dim', 128)
+            sc_num_heads = sc_dag_config.get('num_heads', 4)
+            sc_groups = sc_dag_config.get('groups', None) or DEFAULT_SUBCIRCUIT_GROUPS
+            sc_edges = sc_dag_config.get('edges', None) or DEFAULT_DAG_EDGES
+            self._sc_groups = sc_groups
+            self._sc_group_names = list(sc_groups.keys())
+            self._sc_num_groups = len(self._sc_group_names)
+            # Build assignment: mosfet index → subcircuit index
+            assignment = torch.full((24,), -1, dtype=torch.long)
+            for sc_idx, (sc_name, device_indices) in enumerate(sc_groups.items()):
+                for dev_idx in device_indices:
+                    assignment[dev_idx] = sc_idx
+            self.register_buffer('_sc_assignment', assignment)
+            # Build topological order from DAG edges
+            parent_map = {i: [] for i in range(self._sc_num_groups)}
+            for src, dst in sc_edges:
+                parent_map[dst].append(src)
+            # Process non-root nodes in dependency order
+            self._sc_topo_order = []
+            processed = set(i for i in range(self._sc_num_groups) if not parent_map[i])
+            remaining = set(range(self._sc_num_groups)) - processed
+            while remaining:
+                for child in sorted(remaining):
+                    if all(p in processed for p in parent_map[child]):
+                        self._sc_topo_order.append((child, parent_map[child]))
+                        processed.add(child)
+                remaining -= processed
+            # Attention pooler
+            self.sc_attn_pool = SubcircuitAttentionPool(
+                input_dim=hidden_dim, output_dim=sc_dim, num_heads=sc_num_heads)
+            # DAGNN-style attention + GRU for sequential DAG processing
+            self.sc_dag_W_q = nn.Linear(sc_dim, sc_dim)
+            self.sc_dag_W_k = nn.Linear(sc_dim, sc_dim)
+            self.sc_dag_W_v = nn.Linear(sc_dim, sc_dim)
+            self.sc_dag_attn_a = nn.Linear(2 * sc_dim, 1)
+            self.sc_dag_gru = nn.GRUCell(sc_dim, sc_dim)
+            # Gated fusion
+            self.sc_gate_proj = nn.Linear(hidden_dim + sc_dim, hidden_dim)
+            nn.init.zeros_(self.sc_gate_proj.bias)
 
         # Flag for capturing MHA outputs in _run_layers (updated after DC gain init)
         self._need_mha_capture = (self.predict_ac and getattr(self, 'ac_readout', '') in ('cross_attn', 'mha_pool'))
@@ -964,6 +1271,9 @@ class TowerGENConv(BaseGNN):
                 # Optional: augment with VN embedding for global circuit context
                 self.dc_gain_use_vn = dc_gain_config.get('use_vn_context', False)
                 dc_physics_dim = 35  # 14 gm + 14 gds + 7 formula intermediates
+                self.dc_gain_use_volt_ctx = dc_gain_config.get('use_voltage_context', False)
+                if self.dc_gain_use_volt_ctx:
+                    dc_physics_dim += 28  # 14 Vgs + 14 Vds
                 if self.dc_gain_use_vn:
                     dc_vn_proj_dim = dc_gain_config.get('vn_projection_dim', 0)
                     if dc_vn_proj_dim > 0:
@@ -1152,6 +1462,15 @@ class TowerGENConv(BaseGNN):
                         nn.Linear(2, 1),
                         nn.Sigmoid(),
                     )
+            elif self.dc_gain_mode == 'pool':
+                # Simple mean+max pool of all nodes → MLP
+                dc_hidden = dc_gain_config.get('hidden_dim', 128)
+                self.dc_gain_head = nn.Sequential(
+                    nn.Linear(2 * hidden_dim, dc_hidden),
+                    nn.LayerNorm(dc_hidden),
+                    get_activation(self.act_type),
+                    nn.Linear(dc_hidden, 1),
+                )
             else:
                 # Cross-attention mode (original)
                 dc_num_heads = dc_gain_config.get('num_heads', 4)
@@ -1330,6 +1649,13 @@ class TowerGENConv(BaseGNN):
             N_per = (data.ptr[1] - data.ptr[0]).item()
             D_per = self._cached_dtm.shape[0]
             E_loop = self._cached_loop_ei.shape[1]
+            # Debug: validate loop edge indices
+            if E_loop > 0:
+                D_total = D_per * num_graphs
+                max_idx = self._cached_loop_ei.max().item()
+                if max_idx >= D_per:
+                    print(f"[LoopAttention WARNING] cached loop_ei max={max_idx} >= D_per={D_per}, clamping")
+                    self._cached_loop_ei = self._cached_loop_ei.clamp(max=D_per - 1)
 
             if E_loop == 0:
                 node_ei = self._cached_node_loop_ei.to(dev) if self._cached_node_loop_ei is not None else None
@@ -1564,6 +1890,96 @@ class TowerGENConv(BaseGNN):
         backbone_hidden = self.backbone_jk(backbone_outputs)
         backbone_hidden = self.backbone[0].act(self.backbone[0].norm(backbone_hidden))
 
+        # --- Subcircuit DAG (enrich MOSFET terminal embeddings) ---
+        _sc_embs = None  # stored for UGBW physics_dag readout
+        _sc_embs_live = None  # non-detached version for physics_dag_residual
+        if self.use_subcircuit_dag and self.current_epoch >= self.sc_dag_warmup_epochs:
+            mi = data.mosfet_info.long()
+            n_mosfets = mi.shape[0]
+            n_graphs = data.ptr.shape[0] - 1
+            m_per_graph = n_mosfets // n_graphs  # 24 for fixed topology
+            m_ptr = getattr(data, 'mosfet_ptr', None)
+            if m_ptr is not None:
+                m_graph_idx = torch.bucketize(
+                    torch.arange(n_mosfets, device=data.ptr.device),
+                    m_ptr[1:].to(data.ptr.device), right=True)
+            else:
+                m_graph_idx = torch.arange(n_mosfets, device=data.ptr.device) // m_per_graph
+            m_offsets = data.ptr[m_graph_idx]
+
+            # Gather all 4 terminal embeddings per MOSFET
+            gate_h = backbone_hidden[mi[:, 0] + m_offsets]    # [B*24, 128]
+            drain_h = backbone_hidden[mi[:, 1] + m_offsets]   # [B*24, 128]
+            source_h = backbone_hidden[mi[:, 2] + m_offsets]  # [B*24, 128]
+            bulk_h = backbone_hidden[mi[:, 2] + 1 + m_offsets]  # [B*24, 128]
+            all_terms = torch.stack([gate_h, drain_h, source_h, bulk_h], dim=1)  # [B*24, 4, 128]
+            all_terms = all_terms.view(n_graphs, m_per_graph, 4, -1)  # [B, 24, 4, 128]
+
+            # Attention pool per subcircuit
+            sc_embs = []
+            for sc_name in self._sc_group_names:
+                dev_indices = self._sc_groups[sc_name]
+                # Gather terminals for this subcircuit: [B, num_devs*4, 128]
+                sc_terms = all_terms[:, dev_indices].reshape(n_graphs, -1, backbone_hidden.shape[-1])
+                sc_emb = self.sc_attn_pool(sc_terms)  # [B, sc_dim]
+                sc_embs.append(sc_emb)
+            sc_embs = torch.stack(sc_embs, dim=1)  # [B, 7, sc_dim]
+
+            # Sequential topological DAG with attention + GRU (DAGNN-style)
+            sc_list = [sc_embs[:, i] for i in range(self._sc_num_groups)]
+
+            for sc_idx, parent_indices in self._sc_topo_order:
+                child_emb = sc_list[sc_idx]  # [B, sc_dim]
+                parent_embs = torch.stack([sc_list[p] for p in parent_indices], dim=1)  # [B, P, sc_dim]
+
+                # Attention over parents
+                q = self.sc_dag_W_q(child_emb).unsqueeze(1).expand_as(parent_embs)  # [B, P, sc_dim]
+                k = self.sc_dag_W_k(parent_embs)  # [B, P, sc_dim]
+                v = self.sc_dag_W_v(parent_embs)  # [B, P, sc_dim]
+                scores = self.sc_dag_attn_a(F.leaky_relu(torch.cat([q, k], dim=-1), 0.2)).squeeze(-1)  # [B, P]
+                alpha = torch.softmax(scores, dim=-1)  # [B, P]
+                message = (alpha.unsqueeze(-1) * v).sum(dim=1)  # [B, sc_dim]
+
+                # GRU update
+                sc_list[sc_idx] = self.sc_dag_gru(message, child_emb)  # [B, sc_dim]
+
+            sc_embs = torch.stack(sc_list, dim=1)  # [B, 7, sc_dim]
+            _sc_embs = sc_embs.detach() if getattr(self, 'ac_detach', True) else sc_embs  # detach unless AC needs gradients
+            _sc_embs_live = sc_embs  # always keep live version for physics_dag_residual correction
+
+            # Compute warmup alpha for gradual DAG introduction
+            if self.sc_dag_warmup_duration > 0:
+                warmup_progress = self.current_epoch - self.sc_dag_warmup_epochs
+                sc_alpha = min(1.0, warmup_progress / self.sc_dag_warmup_duration)
+            else:
+                sc_alpha = 1.0
+
+            # Scatter back to MOSFET terminals with gated fusion
+            # assignment: [24] → subcircuit index per device
+            for dev_idx in range(m_per_graph):
+                sc_idx = self._sc_assignment[dev_idx].item()
+                if sc_idx < 0:
+                    continue
+                sc_emb_for_dev = sc_embs[:, sc_idx]  # [B, sc_dim]
+                # Apply to all 4 terminals (G, D, S, B) of this device
+                for term_col in [0, 1, 2]:
+                    term_global = mi[:, term_col] + m_offsets  # [B*24] but we want this device only
+                    # Select only this device across all graphs
+                    dev_mask = torch.arange(n_mosfets, device=mi.device) % m_per_graph == dev_idx
+                    term_idx = mi[dev_mask, term_col] + m_offsets[dev_mask]
+                    sc_for_term = sc_emb_for_dev  # [B, sc_dim]
+                    bh_at_term = backbone_hidden[term_idx]  # [B, 128]
+                    gate = torch.sigmoid(self.sc_gate_proj(
+                        torch.cat([bh_at_term, sc_for_term], dim=-1)))  # [B, 128]
+                    backbone_hidden[term_idx] = sc_alpha * gate * sc_for_term + (1 - sc_alpha * gate) * bh_at_term
+                # Bulk terminal (source + 1)
+                dev_mask = torch.arange(n_mosfets, device=mi.device) % m_per_graph == dev_idx
+                bulk_idx = mi[dev_mask, 2] + 1 + m_offsets[dev_mask]
+                bh_at_bulk = backbone_hidden[bulk_idx]
+                gate = torch.sigmoid(self.sc_gate_proj(
+                    torch.cat([bh_at_bulk, sc_emb_for_dev], dim=-1)))
+                backbone_hidden[bulk_idx] = sc_alpha * gate * sc_emb_for_dev + (1 - sc_alpha * gate) * bh_at_bulk
+
         # --- gm/Id auxiliary prediction (backbone-level) ---
         _gm_id_pred = None
         if self.predict_gm_id and self.gm_id_head is not None:
@@ -1601,18 +2017,23 @@ class TowerGENConv(BaseGNN):
         # --- State Tower ---
         _state_loop = _loop_attn if (self.use_loop_attention and getattr(self, 'loop_attn_apply_to', 'backbone') == 'all') else None
         _state_offset = getattr(self, '_loop_attn_backbone_count', 0)
-        state_outputs, _, _ = self._run_layers(
-            self.state_tower, tower_input, data.edge_index, edge_attr,
-            loop_attn_layers=_state_loop,
-            loop_attn_offset=_state_offset,
-            device_terminal_map=_loop_dtm,
-            loop_edge_index=_loop_ei,
-            node_loop_edge_index=_node_loop_ei,
-        )
-
-        # Get state hidden (before skip) for sensitivity conditioning
-        state_hidden = self.state_jk(state_outputs)
-        state_hidden = self.state_tower[0].act(self.state_tower[0].norm(state_hidden))
+        if self.state_tower_num_layers > 0:
+            state_outputs, _, _ = self._run_layers(
+                self.state_tower, tower_input, data.edge_index, edge_attr,
+                loop_attn_layers=_state_loop,
+                loop_attn_offset=_state_offset,
+                device_terminal_map=_loop_dtm,
+                loop_edge_index=_loop_ei,
+                node_loop_edge_index=_node_loop_ei,
+            )
+            if self.unified_state_jk:
+                unified_state = backbone_outputs + state_outputs[1:]  # [x_in, bb0..bb5, tw0, tw1]
+                state_hidden = self.state_jk(unified_state)
+            else:
+                state_hidden = self.state_jk(state_outputs)
+            state_hidden = self.state_tower[0].act(self.state_tower[0].norm(state_hidden))
+        else:
+            state_hidden = tower_input
 
         # State repr with skip connection for prediction heads
         state_repr = torch.cat([state_hidden, x_in], dim=-1) if self.skip_connection else state_hidden
@@ -1623,6 +2044,24 @@ class TowerGENConv(BaseGNN):
             result['mosfet_gm_id_pred'] = _gm_id_pred
         result['node_voltages'] = self.voltage_head(state_repr).squeeze(-1)
         result['node_embeddings'] = state_repr
+
+        # Vgs/Vds prediction from terminal embeddings
+        if self.predict_vgsvds and self.vgsvds_head is not None:
+            mi = data.mosfet_info.long()
+            num_mosfets = mi.shape[0]
+            n_graphs = data.ptr.shape[0] - 1
+            m_ptr = getattr(data, 'mosfet_ptr', None)
+            if m_ptr is not None:
+                mg_idx = torch.bucketize(torch.arange(num_mosfets, device=data.ptr.device),
+                                          m_ptr[1:].to(data.ptr.device), right=True)
+            else:
+                mg_idx = torch.arange(num_mosfets, device=data.ptr.device) // (num_mosfets // n_graphs)
+            vd_offsets = data.ptr[mg_idx]
+            g_emb = state_repr[mi[:, 0] + vd_offsets]
+            d_emb = state_repr[mi[:, 1] + vd_offsets]
+            s_emb = state_repr[mi[:, 2] + vd_offsets]
+            vgsvds_input = torch.cat([g_emb, d_emb, s_emb], dim=-1)
+            result['vgsvds_pred'] = self.vgsvds_head(vgsvds_input)  # [M, 2]
 
         if self.predict_currents:
             if self.use_device_pooling_current and self.device_current_head is not None:
@@ -1756,29 +2195,43 @@ class TowerGENConv(BaseGNN):
                 else:
                     sens_input = tower_input
 
-                _sens_loop = _loop_attn if (self.use_loop_attention and self.loop_attn_apply_to in ('all', 'sensitivity')) else None
-                _sens_offset = 0 if (self.use_loop_attention and self.loop_attn_apply_to == 'sensitivity') else getattr(self, '_loop_attn_backbone_count', 0) + getattr(self, '_loop_attn_state_count', 0)
-                sens_outputs, _, _ = self._run_layers(
-                    self.sensitivity_tower, sens_input, data.edge_index, edge_attr,
-                    loop_attn_layers=_sens_loop,
-                    loop_attn_offset=_sens_offset,
-                    device_terminal_map=_loop_dtm,
-                    loop_edge_index=_loop_ei,
-                    node_loop_edge_index=_node_loop_ei,
-                )
+                if self.sensitivity_tower_num_layers > 0:
+                    _sens_loop = _loop_attn if (self.use_loop_attention and self.loop_attn_apply_to in ('all', 'sensitivity')) else None
+                    _sens_offset = 0 if (self.use_loop_attention and self.loop_attn_apply_to == 'sensitivity') else getattr(self, '_loop_attn_backbone_count', 0) + getattr(self, '_loop_attn_state_count', 0)
+                    sens_outputs, _, _ = self._run_layers(
+                        self.sensitivity_tower, sens_input, data.edge_index, edge_attr,
+                        loop_attn_layers=_sens_loop,
+                        loop_attn_offset=_sens_offset,
+                        device_terminal_map=_loop_dtm,
+                        loop_edge_index=_loop_ei,
+                        node_loop_edge_index=_node_loop_ei,
+                    )
+                else:
+                    sens_outputs = [sens_input]
 
-            # Compute detached voltage context scalars (Vgs, Vds, Vbs) if enabled
+            # Compute voltage context scalars (Vgs, Vds, Vbs) if enabled
             if self.ss_voltage_context:
-                v_pred = result['node_voltages'].detach()
-                v_gate = v_pred[mosfet_info[:, 0] + offsets]
-                v_drain = v_pred[mosfet_info[:, 1] + offsets]
-                v_source = v_pred[mosfet_info[:, 2] + offsets]
-                v_bulk = v_pred[mosfet_info[:, 2] + 1 + offsets]
-                volt_ctx = torch.stack([v_gate - v_source, v_drain - v_source, v_bulk - v_source], dim=-1)
+                if self.predict_vgsvds and 'vgsvds_pred' in result:
+                    # Use predicted Vgs/Vds from dedicated head, Vbs from net voltages
+                    vgsvds = result['vgsvds_pred'].detach() if self.vgsvds_detach else result['vgsvds_pred']
+                    vgs_ctx = vgsvds[:, 0]
+                    vds_ctx = vgsvds[:, 1]
+                    v_pred = result['node_voltages'].detach()
+                    v_source = v_pred[mosfet_info[:, 2] + offsets]
+                    v_bulk = v_pred[mosfet_info[:, 2] + 1 + offsets]
+                    vbs_ctx = v_bulk - v_source
+                    volt_ctx = torch.stack([vgs_ctx, vds_ctx, vbs_ctx], dim=-1)
+                else:
+                    v_pred = result['node_voltages'] if not self.detach_state_for_sens else result['node_voltages'].detach()
+                    v_gate = v_pred[mosfet_info[:, 0] + offsets]
+                    v_drain = v_pred[mosfet_info[:, 1] + offsets]
+                    v_source = v_pred[mosfet_info[:, 2] + offsets]
+                    v_bulk = v_pred[mosfet_info[:, 2] + 1 + offsets]
+                    volt_ctx = torch.stack([v_gate - v_source, v_drain - v_source, v_bulk - v_source], dim=-1)
 
-            # Compute detached current context (ID at drain) if enabled
+            # Compute current context (ID at drain) if enabled
             if self.ss_current_context:
-                i_pred = result['node_currents'].detach()
+                i_pred = result['node_currents'] if not self.detach_state_for_sens else result['node_currents'].detach()
                 i_drain = i_pred[mosfet_info[:, 1] + offsets].unsqueeze(-1)
 
             # Extract W/L context from raw node features at gate terminal
@@ -1797,9 +2250,13 @@ class TowerGENConv(BaseGNN):
                 # Finalize sens_repr first if needed (for region head only, before SS branching)
                 if not self.ss_from_state and self.gm_branch is None:
                     # Standard path: need to finalize sens_repr before using it
-                    sens_repr = self._finalize_repr(
-                        self.sensitivity_jk, sens_outputs, self.sensitivity_tower[0], x_in,
-                    )
+                    if self.sensitivity_tower_num_layers > 0:
+                        _sens_jk_inputs = (backbone_outputs + sens_outputs[1:]) if getattr(self, 'unified_sensitivity_jk', False) else sens_outputs
+                        sens_repr = self._finalize_repr(
+                            self.sensitivity_jk, _sens_jk_inputs, self.sensitivity_tower[0], x_in,
+                        )
+                    else:
+                        sens_repr = torch.cat([sens_outputs[0], x_in], dim=-1) if self.skip_connection else sens_outputs[0]
                     _sens_repr_finalized = True
                 else:
                     _sens_repr_finalized = False
@@ -1880,9 +2337,13 @@ class TowerGENConv(BaseGNN):
             else:
                 # Standard path: shared sensitivity tower (or state tower) → separate MLP heads
                 if not self.ss_from_state and not _sens_repr_finalized:
-                    sens_repr = self._finalize_repr(
-                        self.sensitivity_jk, sens_outputs, self.sensitivity_tower[0], x_in,
-                    )
+                    if self.sensitivity_tower_num_layers > 0:
+                        _sens_jk_inputs = (backbone_outputs + sens_outputs[1:]) if getattr(self, 'unified_sensitivity_jk', False) else sens_outputs
+                        sens_repr = self._finalize_repr(
+                            self.sensitivity_jk, _sens_jk_inputs, self.sensitivity_tower[0], x_in,
+                        )
+                    else:
+                        sens_repr = torch.cat([sens_outputs[0], x_in], dim=-1) if self.skip_connection else sens_outputs[0]
 
                 gate_emb = sens_repr[mosfet_info[:, 0] + offsets]
                 drain_emb = sens_repr[mosfet_info[:, 1] + offsets]
@@ -1942,8 +2403,11 @@ class TowerGENConv(BaseGNN):
                     result['mosfet_gm_pred'] = self.gm_head(gm_repr).squeeze(-1)
                     result['mosfet_gds_pred'] = self.gds_head(gds_repr).squeeze(-1)
                 else:
-                    parts = [gate_emb, drain_emb, source_emb]
-                    if self.ss_include_bulk:
+                    if getattr(self, 'ss_drain_only', False):
+                        parts = [drain_emb]
+                    else:
+                        parts = [gate_emb, drain_emb, source_emb]
+                    if not getattr(self, 'ss_drain_only', False) and self.ss_include_bulk:
                         bulk_emb = sens_repr[mosfet_info[:, 2] + 1 + offsets]
                         parts.append(bulk_emb)
                     if self.ss_diff_features:
@@ -1992,6 +2456,21 @@ class TowerGENConv(BaseGNN):
                         # Non-detached routing: SS loss flows through region probs
                         result['mosfet_gm_pred'] = (gm_expert_out * region_probs).sum(dim=-1)
                         result['mosfet_gds_pred'] = (gds_expert_out * region_probs).sum(dim=-1)
+                    elif getattr(self, 'use_subcircuit_heads', False):
+                        # Subcircuit-conditioned: route each MOSFET through its subcircuit's head
+                        gm_preds = torch.zeros(num_mosfets, device=ss_input.device)
+                        gds_preds = torch.zeros(num_mosfets, device=ss_input.device)
+                        for sc_name, sc_indices in self._subcircuit_groups.items():
+                            local_mask = torch.zeros(24, dtype=torch.bool, device=ss_input.device)
+                            for idx in sc_indices:
+                                local_mask[idx] = True
+                            batch_mask = local_mask.repeat(num_graphs)
+                            if batch_mask.any():
+                                sc_input = ss_input[batch_mask]
+                                gm_preds[batch_mask] = self.subcircuit_gm_heads[sc_name](sc_input).squeeze(-1)
+                                gds_preds[batch_mask] = self.subcircuit_gds_heads[sc_name](sc_input).squeeze(-1)
+                        result['mosfet_gm_pred'] = gm_preds
+                        result['mosfet_gds_pred'] = gds_preds
                     else:
                         result['mosfet_gm_pred'] = self.gm_head(ss_input).squeeze(-1)
                         result['mosfet_gds_pred'] = self.gds_head(ss_input).squeeze(-1)
@@ -2070,51 +2549,53 @@ class TowerGENConv(BaseGNN):
                 gm_key = log10_gm_b[:, idx]     # [B, 14] log10 domain
                 gds_key = log10_gds_b[:, idx]    # [B, 14] log10 domain
 
-                # Convert to linear for formula computation (clamped for stability)
-                gm_lin = torch.pow(10.0, gm_key.clamp(-12, 0))    # [B, 14]
-                gds_lin = torch.pow(10.0, gds_key.clamp(-12, 0))   # [B, 14]
-
+                # All computation in log10 space — no pow(10,...) needed
                 # Index map within the 14 key MOSFETs:
                 # 0=M8, 1=M9, 2=M5, 3=M6, 4=M15, 5=M16, 6=M19, 7=M20
                 # 8=M7, 9=M10, 10=M21, 11=M22, 12=M11, 13=M23
 
-                # Stage 1: A1 = gm8 * Rout1
+                # Stage 1: log10(Rout1) = -log10(gds6 + gds16) or cascode variant
                 if self._dc_rout1_formula == 'simple':
-                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)  # 1/(gds6 + gds16)
-                else:  # cascode
-                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] * gds_lin[:, 7] / (gm_lin[:, 5] + 1e-15) + 1e-15)
-                A1 = gm_lin[:, 0] * Rout1  # gm_M8 * Rout1
+                    log_rout1 = -log10_add(gds_key[:, 3], gds_key[:, 5])
+                else:  # cascode: second term = gds16*gds20/gm16
+                    log_cascode_term = gds_key[:, 5] + gds_key[:, 7] - gm_key[:, 5]
+                    log_rout1 = -log10_add(gds_key[:, 3], log_cascode_term)
+                log_A1 = gm_key[:, 0] + log_rout1  # log10(gm8 * Rout1)
 
                 # Stage 2: A2 = [gm10/(gm21+gds21+gds10)] * [gm22/(gds7+gds22)]
-                A2_part1 = gm_lin[:, 9] / (gm_lin[:, 10] + gds_lin[:, 10] + gds_lin[:, 9] + 1e-15)
-                A2 = A2_part1 * gm_lin[:, 11] / (gds_lin[:, 8] + gds_lin[:, 11] + 1e-15)
+                log_denom1 = log10_add(log10_add(gm_key[:, 10], gds_key[:, 10]), gds_key[:, 9])
+                log_A2_p1 = gm_key[:, 9] - log_denom1
+                log_denom2 = log10_add(gds_key[:, 8], gds_key[:, 11])
+                log_A2 = log_A2_p1 + gm_key[:, 11] - log_denom2
 
                 # Stage 3: Rout3 = 1/(gds11+gds23), loaded with R_load
-                Rout3 = 1.0 / (gds_lin[:, 12] + gds_lin[:, 13] + 1e-15)  # gds_M11 + gds_M23
+                log_rout3 = -log10_add(gds_key[:, 12], gds_key[:, 13])
                 R_load = self._dc_r_in + self._dc_r_f
-                Rout3_loaded = 1.0 / (1.0 / (Rout3 + 1e-15) + 1.0 / R_load)
+                log_inv_rload = torch.tensor(-math.log10(float(R_load)), device=gm_key.device)
+                log_rout3_loaded = -log10_add(-log_rout3, log_inv_rload)
 
                 # Feedback factor
                 beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
 
-                # T = A1 * Rout3_loaded * (gm11 + A2 * gm23) * beta
-                T = A1 * Rout3_loaded * (gm_lin[:, 12] + A2 * gm_lin[:, 13]) * beta
-                dc_gain_est_dB = 20.0 * torch.log10(T.abs() + 1e-15)  # [B]
+                # T = A1 * Rout3_loaded * (gm11 + A2*gm23) * beta
+                log_sum_gm = log10_add(gm_key[:, 12], log_A2 + gm_key[:, 13])
+                log_T = log_A1 + log_rout3_loaded + log_sum_gm + math.log10(float(beta))
+                dc_gain_est_dB = 20.0 * log_T  # [B], already in log10
 
-                # Formula intermediates as features (log10 scale)
-                log10_Rout1 = torch.log10(Rout1.clamp(min=1e-15))
-                log10_A1 = torch.log10(A1.clamp(min=1e-15))
-                log10_A2_p1 = torch.log10(A2_part1.clamp(min=1e-15))
-                log10_A2 = torch.log10(A2.clamp(min=1e-15))
-                log10_Rout3 = torch.log10(Rout3.clamp(min=1e-15))
-                log10_Rout3_ld = torch.log10(Rout3_loaded.clamp(min=1e-15))
-
-                # Assemble: 14 gm + 14 gds + 7 formula intermediates = 35 features
+                # Assemble: 14 gm + 14 gds + 7 formula intermediates = 35 features (all log10)
                 formula_feats = torch.stack([
-                    log10_Rout1, log10_A1, log10_A2_p1, log10_A2,
-                    log10_Rout3, log10_Rout3_ld, dc_gain_est_dB,
+                    log_rout1, log_A1, log_A2_p1, log_A2,
+                    log_rout3, log_rout3_loaded, dc_gain_est_dB,
                 ], dim=-1)  # [B, 7]
                 parts = [gm_key, gds_key, formula_feats]
+                # Optionally augment with voltage operating point context (Vgs, Vds)
+                if getattr(self, 'dc_gain_use_volt_ctx', False):
+                    v_pred = result['node_voltages'].detach()
+                    v_gate = v_pred[mosfet_info[:, 0] + offsets].view(B, M)[:, idx]
+                    v_drain = v_pred[mosfet_info[:, 1] + offsets].view(B, M)[:, idx]
+                    v_source = v_pred[mosfet_info[:, 2] + offsets].view(B, M)[:, idx]
+                    parts.append(v_gate - v_source)  # Vgs [B, 14]
+                    parts.append(v_drain - v_source)  # Vds [B, 14]
                 # Optionally augment with VN context for global circuit info
                 if self.dc_gain_use_vn:
                     if len(backbone_mha_outputs) > 0:
@@ -2179,6 +2660,13 @@ class TowerGENConv(BaseGNN):
                 result['dc_gain_pred'] = self.dc_gain_head(
                     torch.cat([stage1, stage2, stage3, bias], dim=-1)
                 ).squeeze(-1)
+            elif self.dc_gain_mode == 'pool':
+                # Simple mean+max pool of all nodes → MLP
+                from torch_geometric.nn import global_mean_pool, global_max_pool
+                pool_mean = global_mean_pool(backbone_hidden.detach(), batch_vec)
+                pool_max = global_max_pool(backbone_hidden.detach(), batch_vec)
+                pool_input = torch.cat([pool_mean, pool_max], dim=-1)
+                result['dc_gain_pred'] = self.dc_gain_head(pool_input).squeeze(-1)
             elif self.dc_gain_mode == 'physics_cross_attn':
                 # Physics formula + cross-attention correction
                 # Step 1: Same physics formula as 'physics' mode
@@ -2193,30 +2681,31 @@ class TowerGENConv(BaseGNN):
                 idx = self._dc_mosfet_indices
                 gm_key = log10_gm.view(B, M)[:, idx]
                 gds_key = log10_gds.view(B, M)[:, idx]
-                gm_lin = torch.pow(10.0, gm_key.clamp(-12, 0))
-                gds_lin = torch.pow(10.0, gds_key.clamp(-12, 0))
-                # Stage gains (same formula as physics mode)
+                # Formula in log10 space (same as physics mode)
                 if self._dc_rout1_formula == 'simple':
-                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)
+                    log_rout1 = -log10_add(gds_key[:, 3], gds_key[:, 5])
                 else:
-                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] * gds_lin[:, 7] / (gm_lin[:, 5] + 1e-15) + 1e-15)
-                A1 = gm_lin[:, 0] * Rout1
-                A2_part1 = gm_lin[:, 9] / (gm_lin[:, 10] + gds_lin[:, 10] + gds_lin[:, 9] + 1e-15)
-                A2 = A2_part1 * gm_lin[:, 11] / (gds_lin[:, 8] + gds_lin[:, 11] + 1e-15)
-                Rout3 = 1.0 / (gds_lin[:, 12] + gds_lin[:, 13] + 1e-15)
+                    log_cascode_term = gds_key[:, 5] + gds_key[:, 7] - gm_key[:, 5]
+                    log_rout1 = -log10_add(gds_key[:, 3], log_cascode_term)
+                log_A1 = gm_key[:, 0] + log_rout1
+                log_denom1 = log10_add(log10_add(gm_key[:, 10], gds_key[:, 10]), gds_key[:, 9])
+                log_A2_p1 = gm_key[:, 9] - log_denom1
+                log_denom2 = log10_add(gds_key[:, 8], gds_key[:, 11])
+                log_A2 = log_A2_p1 + gm_key[:, 11] - log_denom2
+                log_rout3 = -log10_add(gds_key[:, 12], gds_key[:, 13])
                 R_load = self._dc_r_in + self._dc_r_f
-                Rout3_loaded = 1.0 / (1.0 / (Rout3 + 1e-15) + 1.0 / R_load)
+                log_inv_rload = torch.tensor(-math.log10(float(R_load)), device=gm_key.device)
+                log_rout3_loaded = -log10_add(-log_rout3, log_inv_rload)
                 beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
-                T = A1 * Rout3_loaded * (gm_lin[:, 12] + A2 * gm_lin[:, 13]) * beta
-                dc_gain_est_dB = 20.0 * torch.log10(T.abs() + 1e-15)
+                log_sum_gm = log10_add(gm_key[:, 12], log_A2 + gm_key[:, 13])
+                log_T = log_A1 + log_rout3_loaded + log_sum_gm + math.log10(float(beta))
+                dc_gain_est_dB = 20.0 * log_T
                 formula_feats = torch.stack([
-                    torch.log10(Rout1.clamp(min=1e-15)), torch.log10(A1.clamp(min=1e-15)),
-                    torch.log10(A2_part1.clamp(min=1e-15)), torch.log10(A2.clamp(min=1e-15)),
-                    torch.log10(Rout3.clamp(min=1e-15)), torch.log10(Rout3_loaded.clamp(min=1e-15)),
-                    dc_gain_est_dB,
+                    log_rout1, log_A1, log_A2_p1, log_A2,
+                    log_rout3, log_rout3_loaded, dc_gain_est_dB,
                 ], dim=-1)
-                physics_input = torch.cat([gm_key, gds_key, formula_feats], dim=-1)  # [B, 35]
-                physics_pred = self.dc_gain_head(physics_input).squeeze(-1)  # [B]
+                physics_input = torch.cat([gm_key, gds_key, formula_feats], dim=-1)
+                physics_pred = self.dc_gain_head(physics_input).squeeze(-1)
 
                 # Step 2: Cross-attention correction
                 # Physics query tokens: [B, 35, 1] → [B, 35, 128]
@@ -2257,29 +2746,31 @@ class TowerGENConv(BaseGNN):
                 idx = self._dc_mosfet_indices
                 gm_key = log10_gm.view(B, M)[:, idx]
                 gds_key = log10_gds.view(B, M)[:, idx]
-                gm_lin = torch.pow(10.0, gm_key.clamp(-12, 0))
-                gds_lin = torch.pow(10.0, gds_key.clamp(-12, 0))
+                # Formula in log10 space (same as physics mode)
                 if self._dc_rout1_formula == 'simple':
-                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] + 1e-15)
+                    log_rout1 = -log10_add(gds_key[:, 3], gds_key[:, 5])
                 else:
-                    Rout1 = 1.0 / (gds_lin[:, 3] + gds_lin[:, 5] * gds_lin[:, 7] / (gm_lin[:, 5] + 1e-15) + 1e-15)
-                A1 = gm_lin[:, 0] * Rout1
-                A2_part1 = gm_lin[:, 9] / (gm_lin[:, 10] + gds_lin[:, 10] + gds_lin[:, 9] + 1e-15)
-                A2 = A2_part1 * gm_lin[:, 11] / (gds_lin[:, 8] + gds_lin[:, 11] + 1e-15)
-                Rout3 = 1.0 / (gds_lin[:, 12] + gds_lin[:, 13] + 1e-15)
+                    log_cascode_term = gds_key[:, 5] + gds_key[:, 7] - gm_key[:, 5]
+                    log_rout1 = -log10_add(gds_key[:, 3], log_cascode_term)
+                log_A1 = gm_key[:, 0] + log_rout1
+                log_denom1 = log10_add(log10_add(gm_key[:, 10], gds_key[:, 10]), gds_key[:, 9])
+                log_A2_p1 = gm_key[:, 9] - log_denom1
+                log_denom2 = log10_add(gds_key[:, 8], gds_key[:, 11])
+                log_A2 = log_A2_p1 + gm_key[:, 11] - log_denom2
+                log_rout3 = -log10_add(gds_key[:, 12], gds_key[:, 13])
                 R_load = self._dc_r_in + self._dc_r_f
-                Rout3_loaded = 1.0 / (1.0 / (Rout3 + 1e-15) + 1.0 / R_load)
+                log_inv_rload = torch.tensor(-math.log10(float(R_load)), device=gm_key.device)
+                log_rout3_loaded = -log10_add(-log_rout3, log_inv_rload)
                 beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
-                T = A1 * Rout3_loaded * (gm_lin[:, 12] + A2 * gm_lin[:, 13]) * beta
-                dc_gain_est_dB = 20.0 * torch.log10(T.abs() + 1e-15)
+                log_sum_gm = log10_add(gm_key[:, 12], log_A2 + gm_key[:, 13])
+                log_T = log_A1 + log_rout3_loaded + log_sum_gm + math.log10(float(beta))
+                dc_gain_est_dB = 20.0 * log_T
                 formula_feats = torch.stack([
-                    torch.log10(Rout1.clamp(min=1e-15)), torch.log10(A1.clamp(min=1e-15)),
-                    torch.log10(A2_part1.clamp(min=1e-15)), torch.log10(A2.clamp(min=1e-15)),
-                    torch.log10(Rout3.clamp(min=1e-15)), torch.log10(Rout3_loaded.clamp(min=1e-15)),
-                    dc_gain_est_dB,
+                    log_rout1, log_A1, log_A2_p1, log_A2,
+                    log_rout3, log_rout3_loaded, dc_gain_est_dB,
                 ], dim=-1)
-                physics_input = torch.cat([gm_key, gds_key, formula_feats], dim=-1)  # [B, 35]
-                physics_pred = self.dc_gain_head(physics_input).squeeze(-1)  # [B]
+                physics_input = torch.cat([gm_key, gds_key, formula_feats], dim=-1)
+                physics_pred = self.dc_gain_head(physics_input).squeeze(-1)
 
                 # Step 2: Learned path from 14 MOSFET embeddings
                 key_emb = sens_repr[mosfet_info[:, 1] + offsets].view(B, M, -1)[:, idx]  # [B, 14, 149]
@@ -2341,6 +2832,90 @@ class TowerGENConv(BaseGNN):
                 if self.ac_detach:
                     key_emb = key_emb.detach()
                 result['ac_pred'] = self.ac_head(key_emb.reshape(B, -1))  # [B, ac_output_dim]
+            elif self.ac_readout == 'mosfet_physics':
+                # UGBW physics formula in log space + correction MLP
+                B, M = num_graphs, 24
+                idx = self._ac_mosfet_indices
+                gm_pred = result['mosfet_gm_pred']
+                gds_pred = result['mosfet_gds_pred']
+                if self.ac_detach:
+                    gm_pred = gm_pred.detach()
+                    gds_pred = gds_pred.detach()
+                z_gm_key = gm_pred.view(B, M)[:, idx]   # [B, 14] z-scored
+                z_gds_key = gds_pred.view(B, M)[:, idx]  # [B, 14] z-scored
+
+                # gm_M8 in log10 space (for formula estimate)
+                log10_gm_M8 = z_gm_key[:, 0] * self.ss_gm_std_buf + self.ss_gm_mean_buf
+
+                # Cc from capacitor terminal node feature (vectorized)
+                cap_global_idx = data.ptr[:-1] + self._ac_cap_local_idx
+                Cc_norm = data.x[cap_global_idx, 0]
+                log10_Cc = Cc_norm * self._ac_cc_log10_range + self._ac_cc_log10_min
+
+                # Formula in log10 space (no pow(10) needed!)
+                beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
+                log10_ugbw_est = log10_gm_M8 + math.log10(float(beta) / (2 * math.pi)) - log10_Cc
+
+                # Assemble: 14 z_gm + 14 z_gds + Cc_norm + log10_ugbw_est = 30
+                parts = [z_gm_key, z_gds_key, Cc_norm.unsqueeze(-1), log10_ugbw_est.unsqueeze(-1)]
+                physics_input = torch.cat(parts, dim=-1)
+                result['ac_pred'] = self.ac_head(physics_input)
+            elif self.ac_readout == 'mosfet_physics_dag':
+                # UGBW physics formula + DAG subcircuit embeddings
+                B, M = num_graphs, 24
+                idx = self._ac_mosfet_indices
+                gm_pred = result['mosfet_gm_pred']
+                gds_pred = result['mosfet_gds_pred']
+                if self.ac_detach:
+                    gm_pred = gm_pred.detach()
+                    gds_pred = gds_pred.detach()
+                z_gm_key = gm_pred.view(B, M)[:, idx]
+                z_gds_key = gds_pred.view(B, M)[:, idx]
+                log10_gm_M8 = z_gm_key[:, 0] * self.ss_gm_std_buf + self.ss_gm_mean_buf
+                cap_global_idx = data.ptr[:-1] + self._ac_cap_local_idx
+                Cc_norm = data.x[cap_global_idx, 0]
+                log10_Cc = Cc_norm * self._ac_cc_log10_range + self._ac_cc_log10_min
+                beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
+                log10_ugbw_est = log10_gm_M8 + math.log10(float(beta) / (2 * math.pi)) - log10_Cc
+                parts = [z_gm_key, z_gds_key, Cc_norm.unsqueeze(-1), log10_ugbw_est.unsqueeze(-1)]
+                # Append DAG subcircuit embeddings (zeros if DAG not active yet)
+                if _sc_embs is not None:
+                    parts.append(_sc_embs.reshape(B, -1))
+                else:
+                    parts.append(torch.zeros(B, self._ac_dag_dim, device=gm_pred.device))
+                physics_input = torch.cat(parts, dim=-1)
+                result['ac_pred'] = self.ac_head(physics_input)
+            elif self.ac_readout == 'physics_dag_residual':
+                # Physics UGBW estimate + DAG output stage residual correction
+                B, M = num_graphs, 24
+                idx = self._ac_mosfet_indices
+                gm_pred = result['mosfet_gm_pred'].detach()
+                gds_pred = result['mosfet_gds_pred'].detach()
+                z_gm_key = gm_pred.view(B, M)[:, idx]
+                z_gds_key = gds_pred.view(B, M)[:, idx]
+                log10_gm_M8 = z_gm_key[:, 0] * self.ss_gm_std_buf + self.ss_gm_mean_buf
+                cap_global_idx = data.ptr[:-1] + self._ac_cap_local_idx
+                Cc_norm = data.x[cap_global_idx, 0]
+                log10_Cc = Cc_norm * self._ac_cc_log10_range + self._ac_cc_log10_min
+                beta = self._dc_r_in / (self._dc_r_in + self._dc_r_f + 1e-15)
+                log10_ugbw_est = log10_gm_M8 + math.log10(float(beta) / (2 * math.pi)) - log10_Cc
+                physics_input = torch.cat([z_gm_key, z_gds_key, Cc_norm.unsqueeze(-1), log10_ugbw_est.unsqueeze(-1)], dim=-1)
+                physics_pred = self.ac_head(physics_input)  # [B, 1]
+                # DAG correction from output stage (NOT detached)
+                if _sc_embs_live is not None:
+                    dag_output = _sc_embs_live[:, -1, :]  # [B, 128]
+                else:
+                    dag_output = torch.zeros(B, 128, device=backbone_hidden.device)
+                correction = self.ac_dag_correction(dag_output)
+                result['ac_pred'] = physics_pred + correction
+            elif self.ac_readout == 'dag_only':
+                # UGBW from last DAG subcircuit embedding (output stage)
+                B = num_graphs
+                if _sc_embs is not None:
+                    dag_input = _sc_embs[:, -1, :]  # [B, sc_dim] — last subcircuit (output)
+                else:
+                    dag_input = torch.zeros(B, 128, device=backbone_hidden.device)
+                result['ac_pred'] = self.ac_head(dag_input)
             else:
                 # Fallback: mean+max pool (for 'pool' mode or MHA mode where vn_emb is None)
                 from torch_geometric.nn import global_mean_pool, global_max_pool

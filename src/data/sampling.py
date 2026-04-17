@@ -241,16 +241,6 @@ def worker_generate_sample(args: Tuple) -> Tuple[int, Optional[Dict], str]:
                     sim_results['_all_net_voltages']
                 )
 
-            # Compute analytical AC metrics for comparison
-            cc = params.get('C_C', 1e-12)
-            rz = params.get('R_Z', 0.0)
-            r_in = params.get('R_IN', 50e3)
-            r_fb = params.get('R_F', 50e3)
-            w_m6 = params.get('W_M6', 50e-6)
-            analytical_ac = simulator.compute_analytical_ac(
-                sim_results, cc=cc, rz=rz, r_in=r_in, r_fb=r_fb, w_m6=w_m6
-            )
-            sim_results.update(analytical_ac)
         else:
             # Original DC-only simulation
             with open(netlist_path, 'r') as f:

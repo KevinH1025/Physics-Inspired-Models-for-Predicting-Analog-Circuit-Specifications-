@@ -17,6 +17,10 @@ def create_model(
     num_layers=15,
     dropout=0.0,
     genconv_num_layers=2,
+    conv_type='genconv',
+    conv_num_heads=4,
+    mlp_expansion=2,
+    mlp_depth=2,
     num_mlp_layers=3,
     jk_mode='cat',
     jk_attention=False,
@@ -67,6 +71,8 @@ def create_model(
     loop_attention_config=None,
     dc_gain_config=None,
     gm_id_head_config=None,
+    subcircuit_dag_config=None,
+    vgsvds_config=None,
 ):
     """
     Create a GNN model with the specified configuration.
@@ -117,6 +123,10 @@ def create_model(
         num_layers=num_layers,
         dropout=dropout,
         genconv_num_layers=genconv_num_layers,
+        conv_type=conv_type,
+        conv_num_heads=conv_num_heads,
+        mlp_expansion=mlp_expansion,
+        mlp_depth=mlp_depth,
         num_mlp_layers=num_mlp_layers,
         jk_mode=jk_mode,
         jk_attention=jk_attention,
@@ -183,6 +193,10 @@ def create_model(
         dc_gain_config=dc_gain_config or {},
         # gm/Id auxiliary head
         gm_id_head_config=gm_id_head_config or {},
+        # Subcircuit DAG
+        subcircuit_dag_config=subcircuit_dag_config or {},
+        # Vgs/Vds prediction head
+        vgsvds_config=vgsvds_config or {},
     )
 
     # Create model using registry
@@ -215,6 +229,10 @@ def create_model_from_args(args, input_dim, device='cuda'):
         num_layers=args.layers,
         dropout=args.dropout,
         genconv_num_layers=getattr(args, 'genconv_num_layers', 2),
+        conv_type=getattr(args, 'conv_type', 'genconv'),
+        conv_num_heads=getattr(args, 'conv_num_heads', 4),
+        mlp_expansion=getattr(args, 'mlp_expansion', 2),
+        mlp_depth=getattr(args, 'mlp_depth', 2),
         num_mlp_layers=getattr(args, 'num_mlp_layers', 3),
         jk_mode=args.jk_mode,
         jk_attention=args.jk_attention,
@@ -264,6 +282,8 @@ def create_model_from_args(args, input_dim, device='cuda'):
         loop_attention_config=getattr(args, 'loop_attention_config', {}),
         dc_gain_config=getattr(args, 'dc_gain_config', {}),
         gm_id_head_config=getattr(args, 'gm_id_head_config', {}),
+        subcircuit_dag_config=getattr(args, 'subcircuit_dag_config', {}),
+        vgsvds_config=getattr(args, 'vgsvds_config', {}),
     )
 
 

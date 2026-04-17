@@ -136,27 +136,6 @@ if ss_params:
 else:
     print("  FAILED: No small-signal params extracted")
 
-# === Test 6: Analytical AC comparison ===
-print("\n" + "=" * 60)
-print("TEST 6: Analytical vs SPICE AC comparison")
-print("=" * 60)
-
-analytical = sim_ac.compute_analytical_ac(
-    ac_results, cc=params['C_C'], rz=params['R_Z'],
-    r_in=params['R_IN'], r_fb=params['R_F'], w_m6=params['W_M6']
-)
-
-a_gain = analytical.get('_analytical_dc_gain')
-a_ugbw = analytical.get('_analytical_ugbw')
-a_pm = analytical.get('_analytical_pm')
-
-if a_gain is not None and dc_gain is not None:
-    print(f"  DC Gain:  SPICE={dc_gain:.1f} dB,  Analytical={a_gain:.1f} dB,  Gap={dc_gain-a_gain:.1f} dB")
-if a_ugbw is not None and ugbw is not None:
-    print(f"  UGBW:     SPICE={ugbw/1e6:.2f} MHz, Analytical={a_ugbw/1e6:.2f} MHz, Ratio={ugbw/a_ugbw:.2f}")
-if a_pm is not None and pm is not None:
-    print(f"  PM:       SPICE={pm:.1f} deg,  Analytical={a_pm:.1f} deg,  Gap={pm-a_pm:.1f} deg")
-
 print("\n" + "=" * 60)
 print("DONE")
 print("=" * 60)
